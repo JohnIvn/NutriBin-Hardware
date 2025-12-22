@@ -2,14 +2,14 @@ name: Arduino Compile Check
 
 on:
   push:
-    branches: [ main, master, develop ]
+    branches: [main, master, develop]
   pull_request:
-    branches: [ main, master, develop ]
+    branches: [main, master, develop]
 
 jobs:
   compile:
     runs-on: ubuntu-latest
-    
+
     strategy:
       matrix:
         sketch:
@@ -17,29 +17,25 @@ jobs:
           - Hardware/ESP_CAM/ESP_CAM.ino
         board:
           - esp32:esp32:esp32
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      
+
       - name: Setup Arduino CLI
         uses: arduino/setup-arduino-cli@v1
-      
+
       - name: Install ESP32 platform
         run: |
           arduino-cli config init
           arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
           arduino-cli core update-index
           arduino-cli core install esp32:esp32
-      
-      - name: Install libraries
-        run: |
-          arduino-cli lib install "ESP32 Camera"
-      
+
       - name: Compile sketch
         run: |
           arduino-cli compile --fqbn ${{ matrix.board }} ${{ matrix.sketch }}
-      
+
       - name: Show sketch size
         run: |
           arduino-cli compile --fqbn ${{ matrix.board }} ${{ matrix.sketch }} --output-dir build
