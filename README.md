@@ -1,6 +1,8 @@
-# NutriBin-Hardware
+# NutriBin — Machine Hardware
 
-Hardware and firmware source code for the NutriBin project. This repository contains various implementations for ESP32 and Arduino boards to handle networking, monitoring, and sensor integration.
+<img width="936" height="328" alt="image" src="https://github.com/user-attachments/assets/6c962171-3add-41db-a3ba-0d2597b2c2d6" />
+
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Project Status](https://img.shields.io/badge/status-Experimental-orange.svg)](#)
 
 ## Project Structure
 
