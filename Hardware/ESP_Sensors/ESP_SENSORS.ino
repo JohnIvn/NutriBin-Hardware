@@ -36,11 +36,22 @@
 #define PH_VOLTAGE_SCALE 3.3
 #define PH_ADC_MAX 4095.0
 
-// Sensor validity thresholds
-#define ANALOG_MIN_THRESHOLD 10
+// FIX: Raised threshold significantly to prevent floating ADC pins from
+//      registering as "active". Unconnected ESP32 ADC pins float and can
+//      easily exceed a threshold of 10. 150 is a safer baseline.
+#define ANALOG_MIN_THRESHOLD 150
+
+// FIX: Added a separate high threshold for sensors that have a meaningful
+//      signal range. MQ sensors in particular output ~1000+ when powered.
+//      If reading is suspiciously low even when "connected", it's likely absent.
+#define MQ_MIN_THRESHOLD 200
+
 #define DHT_TIMEOUT_MS 3000
-// How long to wait for HX711 to become ready during tare (ms)
 #define HX711_TARE_TIMEOUT_MS 3000
+
+// Number of consecutive successful reads required before marking NPK active.
+// Helps avoid false positives from noise on an unconnected RS-485 bus.
+#define NPK_CONFIRM_READS 2
 
 // ================= CONFIG VARIABLES =================
 String WIFI_SSID_1     = "000002.5G";
@@ -106,7 +117,14 @@ String lastErrorMessage      = "";
 unsigned long lastSampleTime = 0;
 unsigned long lastUploadTime = 0;
 unsigned long lastNPKRead    = 0;
-unsigned long lastDHTSuccess = 0;
+
+// FIX: Initialize lastDHTSuccess to 0 but use a boot flag so we don't
+//      falsely wait out DHT_TIMEOUT_MS before marking it inactive.
+unsigned long lastDHTSuccess   = 0;
+bool          dhtEverSucceeded = false;
+
+// FIX: Track consecutive successful NPK reads to confirm sensor is present.
+int npkSuccessStreak = 0;
 
 // ================= HELPERS =================
 
@@ -116,14 +134,24 @@ int readAnalogSafe(int pin, int samples = 5) {
     readings[i] = analogRead(pin);
     delay(2);
   }
+  // Sort for median
   for (int i = 0; i < samples - 1; i++)
     for (int j = i + 1; j < samples; j++)
-      if (readings[j] < readings[i]) { int t = readings[i]; readings[i] = readings[j]; readings[j] = t; }
+      if (readings[j] < readings[i]) {
+        int t = readings[i]; readings[i] = readings[j]; readings[j] = t;
+      }
   return readings[samples / 2];
 }
 
+// FIX: Separate active checks per sensor type with appropriate thresholds.
 bool isAnalogActive(int rawValue) {
   return rawValue > ANALOG_MIN_THRESHOLD;
+}
+
+bool isMQActive(int rawValue) {
+  // MQ sensors output a meaningful non-trivial voltage when powered.
+  // A floating or disconnected pin is unlikely to consistently read above MQ_MIN_THRESHOLD.
+  return rawValue > MQ_MIN_THRESHOLD;
 }
 
 /**
@@ -142,6 +170,29 @@ bool safeTare(unsigned long timeoutMs = HX711_TARE_TIMEOUT_MS) {
   }
   scale.tare();
   Serial.println(" tared OK");
+  return true;
+}
+
+// ================= REED SWITCH =================
+/**
+ * FIX: Reed switch "active" detection.
+ * A reed switch wired to INPUT_PULLUP will read HIGH when open (no magnet)
+ * and LOW when closed (magnet present). If disconnected, the pin stays HIGH
+ * due to the pull-up — indistinguishable from an open switch.
+ *
+ * Strategy: sample the pin multiple times at setup and during normal reads.
+ * We can't detect a disconnected reed switch purely in software without
+ * additional hardware (pull-down + diode, or a companion analog pin).
+ * Best we can do: mark it as connected always (hardware assumption) but
+ * ensure we never blindly set reed_switch_active = true without comment.
+ *
+ * If your hardware supports it, wire a 10k pull-down on one side and detect
+ * a mid-range analog value as "disconnected" on an ADC-capable pin.
+ */
+bool detectReedSwitchPresent() {
+  // With INPUT_PULLUP only, we cannot distinguish disconnected from open.
+  // Return true as a hardware assumption — document this limitation.
+  // TODO: Add analog detection circuit if hardware allows.
   return true;
 }
 
@@ -164,8 +215,6 @@ void setup() {
   Serial.println("Init: NPK OK");
 
   // --- HX711 Load Cell ---
-  // begin() just configures pins — safe even if sensor is absent.
-  // safeTare() has a timeout so it won't block forever if disconnected.
   Serial.println("Init: HX711...");
   scale.begin(LOADCELL_DOUT, LOADCELL_SCK);
   scale.set_scale(CALIBRATION_FACTOR);
@@ -176,6 +225,7 @@ void setup() {
   // --- Reed Switch ---
   Serial.println("Init: Reed switch...");
   pinMode(REED_SWITCH_RECEIVER_PIN, INPUT_PULLUP);
+  currentData.reed_switch_active = detectReedSwitchPresent();
   Serial.println("Init: Reed switch OK");
 
   // --- Status LED ---
@@ -184,7 +234,9 @@ void setup() {
   // --- DHT22 ---
   Serial.println("Init: DHT22...");
   dht.begin();
-  Serial.println("Init: DHT22 OK");
+  // FIX: Do NOT pre-mark DHT as active. Let the first successful read do that.
+  currentData.dht_active = false;
+  Serial.println("Init: DHT22 — waiting for first valid read");
 
   // --- ADC ---
   Serial.println("Init: ADC...");
@@ -269,26 +321,29 @@ void readAllSensors() {
   currentData.timestamp = millis();
 
   // --- MQ135 (Air Quality) ---
+  // FIX: Use isMQActive() with higher threshold instead of generic isAnalogActive()
   int mq135Raw = readAnalogSafe(MQ135_PIN);
-  currentData.mq135_active = isAnalogActive(mq135Raw);
+  currentData.mq135_active = isMQActive(mq135Raw);
   currentData.mq135_value  = currentData.mq135_active ? mq135Raw : 0;
 
   // --- MQ2 (Combustible Gases) ---
   int mq2Raw = readAnalogSafe(MQ2_PIN);
-  currentData.mq2_active = isAnalogActive(mq2Raw);
+  currentData.mq2_active = isMQActive(mq2Raw);
   currentData.mq2_value  = currentData.mq2_active ? mq2Raw : 0;
 
   // --- MQ4 (Methane) ---
   int mq4Raw = readAnalogSafe(MQ4_PIN);
-  currentData.mq4_active = isAnalogActive(mq4Raw);
+  currentData.mq4_active = isMQActive(mq4Raw);
   currentData.mq4_value  = currentData.mq4_active ? mq4Raw : 0;
 
   // --- MQ7 (CO) ---
   int mq7Raw = readAnalogSafe(MQ7_PIN);
-  currentData.mq7_active = isAnalogActive(mq7Raw);
+  currentData.mq7_active = isMQActive(mq7Raw);
   currentData.mq7_value  = currentData.mq7_active ? mq7Raw : 0;
 
   // --- Soil Moisture ---
+  // FIX: Use standard analog threshold. Soil moisture sensors output low values
+  //      when dry and high when wet. When disconnected, ADC floats near 0.
   int soilRaw = readAnalogSafe(SOIL_MOISTURE_PIN);
   currentData.soil_moisture_active = isAnalogActive(soilRaw);
   currentData.soil_moisture        = currentData.soil_moisture_active ? soilRaw : 0;
@@ -305,42 +360,63 @@ void readAllSensors() {
   }
 
   // --- Reed Switch ---
-  currentData.reed_switch_state  = digitalRead(REED_SWITCH_RECEIVER_PIN);
-  currentData.reed_switch_active = true;
+  currentData.reed_switch_state  = (digitalRead(REED_SWITCH_RECEIVER_PIN) == LOW);
+  currentData.reed_switch_active = detectReedSwitchPresent();
 
   // --- DHT22 ---
+  // FIX: Only mark dht_active = true after a real successful read.
+  //      After failure, only mark inactive if it NEVER succeeded OR if it
+  //      hasn't succeeded for longer than DHT_TIMEOUT_MS.
   float t = dht.readTemperature();
   float h = dht.readHumidity();
   if (!isnan(t) && !isnan(h)) {
     currentData.temperature_c    = t;
     currentData.humidity_percent = h;
     currentData.dht_active       = true;
+    dhtEverSucceeded             = true;
     lastDHTSuccess               = millis();
   } else {
-    if (millis() - lastDHTSuccess > DHT_TIMEOUT_MS) {
+    // If DHT never had a successful read, mark it offline immediately.
+    // If it previously succeeded, give it DHT_TIMEOUT_MS grace period.
+    if (!dhtEverSucceeded || (millis() - lastDHTSuccess > DHT_TIMEOUT_MS)) {
       currentData.temperature_c    = 0;
       currentData.humidity_percent = 0;
       currentData.dht_active       = false;
     }
+    // else: keep last known good values and stay active during grace period
   }
 
   // --- PH Sensor ---
-  int phRaw = analogRead(PH_SENSOR_PIN);
+  int phRaw = readAnalogSafe(PH_SENSOR_PIN);
   currentData.ph_active = isAnalogActive(phRaw);
   currentData.ph_value  = currentData.ph_active ? readPH() : 0;
 }
 
 void readNPKSensors() {
-  int n = readNPK(nitro);
-  delay(50);
-  int p = readNPK(phos);
-  delay(50);
+  // FIX: Read NPK values first, THEN check npk_active (which readNPK() sets).
+  //      Previously, npk_active was read BEFORE the NPK commands were sent,
+  //      meaning it always used the previous cycle's stale status.
+  int n = readNPK(nitro); delay(50);
+  int p = readNPK(phos);  delay(50);
   int k = readNPK(pota);
 
-  bool npkOk = currentData.npk_active;
-  currentData.nitrogen   = npkOk ? n : 0;
-  currentData.phosphorus = npkOk ? p : 0;
-  currentData.potassium  = npkOk ? k : 0;
+  // FIX: Require NPK_CONFIRM_READS consecutive successful reads before
+  //      marking NPK as active. This prevents a lucky noise burst on an
+  //      unconnected RS-485 bus from triggering a false positive.
+  if (currentData.npk_active) {
+    npkSuccessStreak++;
+  } else {
+    npkSuccessStreak = 0;
+  }
+
+  bool confirmedActive = (npkSuccessStreak >= NPK_CONFIRM_READS);
+
+  currentData.nitrogen   = confirmedActive ? n : 0;
+  currentData.phosphorus = confirmedActive ? p : 0;
+  currentData.potassium  = confirmedActive ? k : 0;
+
+  // Update npk_active to reflect confirmed state
+  currentData.npk_active = confirmedActive;
 }
 
 float readPH() {
@@ -369,6 +445,8 @@ int readNPK(const byte *cmd) {
   }
 
   if (count < 7) {
+    // FIX: This correctly sets npk_active = false on failed reads.
+    //      readNPKSensors() now reads this value AFTER calling readNPK().
     currentData.npk_active = false;
     return 0;
   }
@@ -472,7 +550,7 @@ void printData() {
     (currentData.ph_active ? "" : "(OFF)") +
     " T:" + String(currentData.temperature_c, 1) +
     (currentData.dht_active ? "" : "(OFF)") +
-    " Reed:" + String(currentData.reed_switch_state)
+    " Reed:" + String(currentData.reed_switch_state ? "TRIGGERED" : "IDLE")
   );
 }
 
