@@ -1,6 +1,8 @@
 /*
  * NutriBin Servo Controller ESP32
- * External Trigger -> Ultrasonic Detection -> Reed Check -> Servo Sequence -> SSR Relay -> Grinder
+ * Dual Trigger -> Ultrasonic Detection -> Reed Check -> Servo Sequence -> SSR Relay -> Grinder
+ * Trigger 1 (PIN 35) = Servo 1 -> 0°  |  Trigger 2 (PIN 34) = Servo 1 -> 180°
+ * Servo 2 default 90°, always opens to 180° after grinding
  * Transmits reed switch state to main sensor hub ESP32
  * Uploads servo/system status to backend via WiFi
  */
@@ -19,7 +21,8 @@
 #define ULTRASONIC_TRIG 12
 #define ULTRASONIC_ECHO 33
 
-#define TRIGGER_RECEIVE_PIN 35
+#define TRIGGER_1_PIN 35      // Trigger 1 -> Servo 1 goes to 0°
+#define TRIGGER_2_PIN 34      // Trigger 2 -> Servo 1 goes to 180°
 
 #define REED_SWITCH_PIN 25
 #define REED_TRANSMIT_PIN 26
@@ -44,7 +47,6 @@
 #define DISTANCE_READ_INTERVAL 200
 #define COOLDOWN_TIME 2000
 
-// How often to upload status to backend (ms)
 #define STATUS_UPLOAD_INTERVAL 10000
 
 // ================= CONFIG =================
@@ -86,17 +88,17 @@ SystemState currentState = STATE_WAITING_TRIGGER;
 
 // ================= STATE VARIABLES =================
 bool reedSwitchOpen        = false;
-bool externalTriggerActive = false;
+bool trigger1Active        = false;   // Trigger 1 state (Servo 1 -> 0°)
+bool trigger2Active        = false;   // Trigger 2 state (Servo 1 -> 180°)
 float distanceCm           = 0.0;
 unsigned long stateStartTime   = 0;
 unsigned long lastDistanceRead = 0;
 unsigned long lastStatusUpload = 0;
-int servo1RandomAngle          = 0;
+int servo1TargetAngle          = 0;   // Set to 0 or 180 based on which trigger fired
 
 bool lastStatusUploadSuccess = false;
 String lastStatusError       = "";
 
-// Tracks how many full sequences completed this session
 int sequencesCompleted = 0;
 
 // ================= FUNCTION DECLARATIONS =================
@@ -105,7 +107,7 @@ int doPost(const String &url, const String &payload);
 bool uploadServoStatus();
 void setupServos();
 void readReedSwitch();
-void checkExternalTrigger();
+void checkExternalTriggers();
 float readUltrasonicDistance();
 void transmitReedState();
 void resetToIdle();
@@ -120,10 +122,12 @@ void setup() {
 
   Serial.println("\n\n========================================");
   Serial.println("  NutriBin Servo Controller ESP32");
-  Serial.println("  Trigger -> Ultrasonic -> Sequence");
+  Serial.println("  Dual Trigger -> Ultrasonic -> Sequence");
+  Serial.println("  Trigger 1 -> Servo1=0°  |  Trigger 2 -> Servo1=180°");
   Serial.println("========================================\n");
 
-  pinMode(TRIGGER_RECEIVE_PIN, INPUT);
+  pinMode(TRIGGER_1_PIN, INPUT);
+  pinMode(TRIGGER_2_PIN, INPUT);
   pinMode(REED_SWITCH_PIN, INPUT_PULLUP);
   pinMode(REED_TRANSMIT_PIN, OUTPUT);
   pinMode(ULTRASONIC_TRIG, OUTPUT);
@@ -138,15 +142,16 @@ void setup() {
 
   setupServos();
 
-  servo1.write(90);
-  servo2.write(0);
-  servo3.write(180);
+  // Default positions
+  servo1.write(90);   // Neutral until trigger fires
+  servo2.write(90);   // Servo 2 default: 90°
+  servo3.write(180);  // Servo 3 default: 180°
 
   Serial.println("✓ Servo controller ready!");
 
   connectWiFi();
 
-  Serial.println("✓ Waiting for external trigger signal...\n");
+  Serial.println("✓ Waiting for Trigger 1 (->0°) or Trigger 2 (->180°)...\n");
   currentState = STATE_WAITING_TRIGGER;
 }
 
@@ -158,12 +163,12 @@ void loop() {
 
   readReedSwitch();
   transmitReedState();
-  checkExternalTrigger();
+  checkExternalTriggers();
   updateStatusLED();
 
   // Periodic status upload — runs regardless of state
   if (now - lastStatusUpload >= STATUS_UPLOAD_INTERVAL) {
-    lastStatusUpload      = now;
+    lastStatusUpload        = now;
     lastStatusUploadSuccess = uploadServoStatus();
   }
 
@@ -171,8 +176,14 @@ void loop() {
   switch (currentState) {
 
     case STATE_WAITING_TRIGGER:
-      if (externalTriggerActive) {
-        Serial.println("\n>>> EXTERNAL TRIGGER RECEIVED!");
+      if (trigger1Active || trigger2Active) {
+        if (trigger1Active) {
+          servo1TargetAngle = 0;
+          Serial.println("\n>>> TRIGGER 1 RECEIVED! Servo 1 will go to 0° <<<");
+        } else {
+          servo1TargetAngle = 180;
+          Serial.println("\n>>> TRIGGER 2 RECEIVED! Servo 1 will go to 180° <<<");
+        }
         Serial.println(">>> Monitoring ultrasonic sensor...");
         currentState     = STATE_TRIGGER_ACTIVE;
         lastDistanceRead = now;
@@ -180,7 +191,8 @@ void loop() {
       break;
 
     case STATE_TRIGGER_ACTIVE:
-      if (!externalTriggerActive) {
+      // If both triggers lost, return to waiting
+      if (!trigger1Active && !trigger2Active) {
         Serial.println("✗ Trigger signal lost, returning to waiting state");
         resetToIdle();
         break;
@@ -219,8 +231,7 @@ void loop() {
       } else {
         Serial.println("✓ Reed switch CLOSED — starting sequence");
         digitalWrite(RED_LED_PIN, LOW);
-        servo1RandomAngle = random(0, 181);
-        Serial.print("Servo 1 random angle: "); Serial.println(servo1RandomAngle);
+        Serial.print("Servo 1 target angle: "); Serial.print(servo1TargetAngle); Serial.println("°");
         currentState   = STATE_SERVO_1_SORTING;
         stateStartTime = now;
         uploadServoStatus(); // Immediate upload on sequence start
@@ -236,10 +247,11 @@ void loop() {
       break;
 
     case STATE_SERVO_1_SORTING: {
-      Serial.print("Servo 1: 90° -> "); Serial.print(servo1RandomAngle); Serial.println("°");
+      // Move servo 1 from 90° to target angle (0° or 180° based on trigger)
+      Serial.print("Servo 1: 90° -> "); Serial.print(servo1TargetAngle); Serial.println("°");
 
-      int angle = 90;
-      int target = servo1RandomAngle;
+      int angle  = 90;
+      int target = servo1TargetAngle;
       int step   = (target > angle) ? 2 : -2;
       while (angle != target) {
         angle += step;
@@ -272,7 +284,7 @@ void loop() {
         digitalWrite(SSR_RELAY_PIN, HIGH);
         currentState   = STATE_SSR_GRINDING;
         stateStartTime = now;
-        uploadServoStatus(); // Immediate upload — grinder is now on
+        uploadServoStatus(); // Immediate upload — grinder now ON
       }
       break;
 
@@ -280,35 +292,37 @@ void loop() {
       if (now - stateStartTime >= SSR_GRINDER_TIME) {
         digitalWrite(SSR_RELAY_PIN, LOW);
         Serial.println("✓ Grinder stopped");
-        Serial.println("\n>>> Opening grinder gate (Servo 2)...");
+        Serial.println("\n>>> Opening grinder gate (Servo 2: 90° -> 180°)...");
         currentState = STATE_SERVO_2_OPENING;
-        uploadServoStatus(); // Immediate upload — grinder is now off
+        uploadServoStatus(); // Immediate upload — grinder now OFF
       }
       break;
 
     case STATE_SERVO_2_OPENING: {
-      Serial.println("Servo 2: 0° -> 180°");
-      int angle = 0;
+      // Servo 2 always sweeps from 90° -> 180° after grinding
+      Serial.println("Servo 2: 90° -> 180°");
+      int angle = 90;
       while (angle < 180) {
         angle += 2;
         servo2.write(angle);
         delay(15);
       }
-      Serial.println("✓ Servo 2 opened");
+      Serial.println("✓ Servo 2 opened to 180°");
       delay(1000);
       currentState = STATE_SERVO_2_CLOSING;
       break;
     }
 
     case STATE_SERVO_2_CLOSING: {
-      Serial.println("Servo 2: 180° -> 0°");
+      // Return servo 2 from 180° back to its default 90°
+      Serial.println("Servo 2: 180° -> 90°");
       int angle = 180;
-      while (angle > 0) {
+      while (angle > 90) {
         angle -= 2;
         servo2.write(angle);
         delay(15);
       }
-      Serial.println("✓ Servo 2 closed");
+      Serial.println("✓ Servo 2 returned to 90°");
       Serial.println("\n>>> Final dump (Servo 3)...");
       currentState = STATE_SERVO_3_DUMPING;
       break;
@@ -327,7 +341,7 @@ void loop() {
       sequencesCompleted++;
       currentState   = STATE_COOLDOWN;
       stateStartTime = now;
-      uploadServoStatus(); // Immediate upload — sequence done
+      uploadServoStatus(); // Immediate upload — sequence complete
       break;
     }
 
@@ -342,9 +356,17 @@ void loop() {
   if (Serial.available()) {
     char cmd = Serial.read();
     switch (cmd) {
-      case 't': case 'T':
+      case '1':
         if (currentState == STATE_WAITING_TRIGGER) {
-          Serial.println("\n>>> MANUAL TRIGGER <<<");
+          Serial.println("\n>>> MANUAL TRIGGER 1 (Servo1 -> 0°) <<<");
+          servo1TargetAngle = 0;
+          currentState = STATE_TRIGGER_ACTIVE;
+        }
+        break;
+      case '2':
+        if (currentState == STATE_WAITING_TRIGGER) {
+          Serial.println("\n>>> MANUAL TRIGGER 2 (Servo1 -> 180°) <<<");
+          servo1TargetAngle = 180;
           currentState = STATE_TRIGGER_ACTIVE;
         }
         break;
@@ -372,9 +394,9 @@ void connectWiFi() {
   Serial.println("\n--- Connecting to WiFi ---");
 
   struct { String ssid; String pass; } networks[] = {
-    { WIFI_SSID_4, WIFI_PASSWORD_4 },
-    { WIFI_SSID_1, WIFI_PASSWORD_1 },
     { WIFI_SSID_2, WIFI_PASSWORD_2 },
+    { WIFI_SSID_1, WIFI_PASSWORD_1 },
+    { WIFI_SSID_4, WIFI_PASSWORD_4 },
     { WIFI_SSID_3, WIFI_PASSWORD_3 }
   };
 
@@ -427,25 +449,21 @@ bool uploadServoStatus() {
   doc["user_id"]    = USER_ID;
   doc["machine_id"] = MACHINE_ID;
 
-  // Current system state as a readable string
   doc["state"] = stateToString(currentState);
 
-  // Individual component states
-  doc["ssr_relay_on"]          = (bool)digitalRead(SSR_RELAY_PIN);
-  doc["reed_switch_open"]      = reedSwitchOpen;
-  doc["external_trigger"]      = externalTriggerActive;
-  doc["red_led_on"]            = (bool)digitalRead(RED_LED_PIN);
-  doc["sequences_completed"]   = sequencesCompleted;
+  doc["ssr_relay_on"]        = (bool)digitalRead(SSR_RELAY_PIN);
+  doc["reed_switch_open"]    = reedSwitchOpen;
+  doc["trigger_1_active"]    = trigger1Active;
+  doc["trigger_2_active"]    = trigger2Active;
+  doc["servo1_target_angle"] = servo1TargetAngle;
+  doc["red_led_on"]          = (bool)digitalRead(RED_LED_PIN);
+  doc["sequences_completed"] = sequencesCompleted;
 
-  // Servo positions
   doc["servo1_angle"] = servo1.read();
   doc["servo2_angle"] = servo2.read();
   doc["servo3_angle"] = servo3.read();
 
-  // Last known ultrasonic reading
-  doc["distance_cm"] = distanceCm;
-
-  // Whether an object is currently in the detection window
+  doc["distance_cm"]    = distanceCm;
   doc["object_in_range"] = (distanceCm >= DETECTION_DISTANCE_MIN && distanceCm <= DETECTION_DISTANCE_MAX);
 
   String payload;
@@ -494,8 +512,9 @@ void readReedSwitch() {
   reedSwitchOpen = digitalRead(REED_SWITCH_PIN);
 }
 
-void checkExternalTrigger() {
-  externalTriggerActive = digitalRead(TRIGGER_RECEIVE_PIN);
+void checkExternalTriggers() {
+  trigger1Active = digitalRead(TRIGGER_1_PIN);
+  trigger2Active = digitalRead(TRIGGER_2_PIN);
 }
 
 float readUltrasonicDistance() {
@@ -519,12 +538,19 @@ void transmitReedState() {
 
 void resetToIdle() {
   servo1.write(90);
-  servo2.write(0);
+  servo2.write(90);   // Servo 2 returns to default 90°
   servo3.write(180);
+
   digitalWrite(SSR_RELAY_PIN, LOW);
   digitalWrite(RED_LED_PIN, LOW);
+
+  trigger1Active    = false;
+  trigger2Active    = false;
+  servo1TargetAngle = 0;
+
   currentState = STATE_WAITING_TRIGGER;
-  Serial.println("✓ System reset — WAITING FOR TRIGGER\n");
+  Serial.println("✓ System reset — WAITING FOR TRIGGER");
+  Serial.println("Waiting for Trigger 1 (->0°) or Trigger 2 (->180°)...\n");
 }
 
 void updateStatusLED() {
@@ -557,7 +583,9 @@ void updateStatusLED() {
 void printStatus() {
   Serial.println("\n========== STATUS ==========");
   Serial.println("State: " + stateToString(currentState));
-  Serial.print("External Trigger: "); Serial.println(externalTriggerActive ? "ACTIVE" : "INACTIVE");
+  Serial.print("Trigger 1 (->0°):   "); Serial.println(trigger1Active  ? "ACTIVE" : "INACTIVE");
+  Serial.print("Trigger 2 (->180°): "); Serial.println(trigger2Active  ? "ACTIVE" : "INACTIVE");
+  Serial.print("Servo 1 Target: "); Serial.print(servo1TargetAngle); Serial.println("°");
   Serial.print("Reed Switch: ");      Serial.println(reedSwitchOpen ? "OPEN (Error)" : "CLOSED (OK)");
   Serial.print("Distance: ");         Serial.print(distanceCm); Serial.println(" cm");
   Serial.print("SSR Relay: ");        Serial.println(digitalRead(SSR_RELAY_PIN) ? "ON" : "OFF");
@@ -568,5 +596,5 @@ void printStatus() {
   Serial.print("° S2="); Serial.print(servo2.read());
   Serial.print("° S3="); Serial.print(servo3.read()); Serial.println("°");
   Serial.println("============================");
-  Serial.println("Commands: t=trigger, s=status, r=reset, u=upload\n");
+  Serial.println("Commands: 1=trigger1(0°), 2=trigger2(180°), s=status, r=reset, u=upload\n");
 }
