@@ -16,7 +16,6 @@ The project is organized into modular sketches within the `Hardware/` directory:
 
 ## Hardware Requirements
 
-- **ESP32-CAM** (AI-Thinker model)
 - **ESP32 Dev Module**
 - **Arduino Uno R3** (or compatible)
 - Sensors/Actuators (Specifics depending on the implementation)
