@@ -1,11 +1,15 @@
-// nutribin_v1.cpp
-// NutriBin Firmware — ESP32  (Sensor Hub + AP Data Server + Debug Panel)
-// VERSION 1 — Sensors + Debug Override Panel
+// nutribin_v3.cpp
+// NutriBin Firmware — ESP32
+// VERSION 3 — Sensors + Debug Override Panel + Manual Servo Control
+//             + Wireless Classification Trigger (/classify POST)
+//             + Fan always on (no NPN alarm logic)
 //
 // Architecture:
 //   The ESP32 acts as a data-serving node only — it does NOT upload to any backend.
 //   It reads sensors, serves them as JSON at /data, and hosts a debug panel at /debug.
-//   Any device (Arduino, laptop, phone) can fetch http://192.168.4.1/data to get readings.
+//   Any device (Arduino, laptop, phone, ML classifier) can:
+//     GET  http://192.168.4.1/data          — read sensor JSON
+//     POST http://192.168.4.1/classify      — send classification trigger
 //
 //   AP  (always-on) : http://192.168.4.1        — NutriBin-Debug WiFi, no internet needed
 //   STA (optional)  : http://192.168.1.50       — joins home router if available, same routes
@@ -17,6 +21,7 @@
 //   RANGE — operator slider / toggle replaces sensor; value held until changed
 //
 // Routes: /   /debug   /debug/set   /data   /terminal   /terminal/json
+//         /servo/set   /classify
 // =====================================================================
 
 #include <ESP32Servo.h>
@@ -88,11 +93,6 @@
 #define ANALOG_MIN_THRESHOLD     150
 #define MQ_MIN_THRESHOLD         200
 
-#define MQ135_ALARM_THRESHOLD    2500
-#define MQ2_ALARM_THRESHOLD      2500
-#define MQ4_ALARM_THRESHOLD      2500
-#define MQ7_ALARM_THRESHOLD      2500
-
 #define DHT_TIMEOUT_MS           3000
 #define HX711_TARE_TIMEOUT_MS    3000
 #define NPK_CONFIRM_READS        2
@@ -120,15 +120,6 @@ const char* AP_PASSWORD = "nutribin123";
 // =====================================================================
 // OVERRIDE SYSTEM
 // =====================================================================
-// LIVE   — real hardware reading
-// OFF    — sensor reported offline; JSON gets 0 / false
-// CYCLE  — fake triangle-wave oscillation (only sensors with real-world dynamics)
-// RANGE  — operator-set value via slider (or toggle for boolean sensors)
-//
-// Sensors WITHOUT cycle (step-change only in real life):
-//   weight      — only changes when waste physically lands on the scale
-//   soil_moisture — changes slowly over hours; not a wave
-
 enum SensorOverride { OVERRIDE_LIVE=0, OVERRIDE_OFF=1, OVERRIDE_CYCLE=2, OVERRIDE_RANGE=3 };
 
 struct OverrideSet {
@@ -139,7 +130,6 @@ OverrideSet ov = {
   OVERRIDE_LIVE, OVERRIDE_LIVE, OVERRIDE_LIVE, OVERRIDE_LIVE, OVERRIDE_LIVE
 };
 
-// Operator-supplied values for RANGE mode
 struct RangeVals {
   int   nitrogen    = 50;
   int   phosphorus  = 30;
@@ -152,18 +142,15 @@ struct RangeVals {
   int   soil        = 1800;
   float temp_c      = 26.0f;
   float humidity    = 65.0f;
-  bool  reed_closed = true;   // true = CLOSED (healthy), false = OPEN (error)
+  bool  reed_closed = true;
   float ph          = 6.8f;
 };
 RangeVals rv;
 
-// Returns true if CYCLE is a meaningful mode for this sensor key
 bool hasCycle(const String& k) {
-  // weight and soil only change on discrete physical events — oscillation is misleading
   return !(k == "weight" || k == "soil");
 }
 
-// Cycle counter — drives oscillation
 unsigned long cycleCounter = 0;
 
 int fakeCycleInt(int lo, int hi, int phase) {
@@ -224,10 +211,20 @@ Servo s1, s2, s3;
 SystemState  curState      = ST_WAIT;
 bool         reedOpen      = false;
 bool         trig1         = false, trig2=false;
+bool         trig1Wireless = false, trig2Wireless = false;  // from /classify
 float        distCm        = 0;
 int          s1Target      = 0;
+int          s1CurrentAngle = 90;
 int          seqDone       = 0;
-bool         fanActive     = false;
+
+// Manual servo override
+bool manualServo   = false;
+int  manSvAngle[3] = {90, 90, 180};
+
+// Last classification result (for /data endpoint)
+String lastClassification = "";
+float  lastClassProb      = 0.0f;
+int    lastClassTrigger   = 0;
 
 unsigned long stateT=0, lastDistT=0, lastSampleT=0, lastNPKT=0;
 bool dhtOK=false; unsigned long lastDHTok=0;
@@ -267,10 +264,10 @@ void readSensors(); void readNPK_all(); int readNPKcmd(const byte* cmd);
 float readPH(); int readADC(int pin, int n=5);
 bool isActive(int v); bool isMQ(int v);
 bool safeTare(unsigned long ms=HX711_TARE_TIMEOUT_MS);
-void updateFan();
 String ovStr(SensorOverride o); SensorOverride strToOv(const String& s);
 void handleRoot(); void handleDebug(); void handleDebugSet();
 void handleData(); void handleTerminal(); void handleTerminalJson();
+void handleServoSet(); void handleClassify();
 String badge(SensorOverride o);
 String sensorRow(const String& lbl, const String& val, bool ok);
 String debugRow(const String& key, const String& lbl,
@@ -281,17 +278,21 @@ String debugRow(const String& key, const String& lbl,
 // =====================================================================
 void setup() {
   Serial.begin(SERIAL_BAUD); delay(800);
-  tprint("NutriBin v1 — Sensor Hub + AP Data Server");
-  tprint("No backend upload — fetch /data to read sensors");
+  tprint("NutriBin v3 — Sensor Hub + AP Data Server + Manual Servo + Classify");
+  tprint("Fan: always on. No backend upload — fetch /data to read sensors.");
 
   pinMode(TRIGGER_1_PIN,INPUT); pinMode(TRIGGER_2_PIN,INPUT);
   pinMode(REED_SWITCH_PIN,INPUT_PULLUP);
   pinMode(ULTRASONIC_TRIG,OUTPUT); pinMode(ULTRASONIC_ECHO,INPUT);
-  pinMode(SSR_RELAY_PIN,OUTPUT); pinMode(GAS_FAN_PIN,OUTPUT);
-  digitalWrite(GAS_FAN_PIN,LOW);
+  pinMode(SSR_RELAY_PIN,OUTPUT);
+
+  // Fan always on
+  pinMode(GAS_FAN_PIN,OUTPUT);
+  digitalWrite(GAS_FAN_PIN,HIGH);
+  tprint("Gas fan: ON (always-on mode)");
 
   setupServos();
-  s1.write(90); s2.write(90); s3.write(180);
+  s1.write(90); s1CurrentAngle=90; s2.write(90); s3.write(180);
 
   pinMode(NPK_RE,OUTPUT); pinMode(NPK_DE,OUTPUT);
   digitalWrite(NPK_RE,LOW); digitalWrite(NPK_DE,LOW);
@@ -306,22 +307,23 @@ void setup() {
   analogReadResolution(12); analogSetAttenuation(ADC_11db);
   memset(&sd,0,sizeof(sd));
 
-  // Network — AP always starts first; STA attempted but non-blocking
   WiFi.mode(WIFI_AP_STA);
   startAP();
-  connectWiFi();  // tries STA; gracefully continues if it fails
+  connectWiFi();
 
-  server.on("/",              handleRoot);
-  server.on("/debug",  HTTP_GET,  handleDebug);
-  server.on("/debug/set", HTTP_POST, handleDebugSet);
-  server.on("/data",   HTTP_GET,  handleData);
-  server.on("/terminal", HTTP_GET, handleTerminal);
+  server.on("/",                    handleRoot);
+  server.on("/debug",  HTTP_GET,    handleDebug);
+  server.on("/debug/set", HTTP_POST,handleDebugSet);
+  server.on("/data",   HTTP_GET,    handleData);
+  server.on("/terminal", HTTP_GET,  handleTerminal);
   server.on("/terminal/json", HTTP_GET, handleTerminalJson);
+  server.on("/servo/set", HTTP_POST,handleServoSet);
+  server.on("/classify",  HTTP_POST,handleClassify);
   server.begin();
 
   tprint("AP  always-on : http://192.168.4.1");
   tprint("STA if joined : http://" + WiFi.localIP().toString());
-  tprint("Routes: /  /debug  /data  /terminal");
+  tprint("Routes: /  /debug  /data  /terminal  /classify");
   tprint("Ready.");
 }
 
@@ -331,35 +333,45 @@ void setup() {
 void loop() {
   unsigned long now=millis();
 
-  // STA reconnect attempt — non-blocking, AP stays up regardless
   if(WiFi.status()!=WL_CONNECTED) connectWiFi();
 
   readReed(); readTriggers();
 
   if(now-lastSampleT>=SAMPLE_INTERVAL){
     lastSampleT=now; cycleCounter++;
-    readSensors(); updateFan();
+    readSensors();
     tprint("W:"+String(sd.weight_kg,2)+(sd.weight_ok?"":"[OFF]")+
            " NPK:"+String(sd.nitrogen)+"/"+String(sd.phosphorus)+"/"+String(sd.potassium)+
            " pH:"+String(sd.ph,2)+" T:"+String(sd.temp_c,1)+
            " Reed:"+(reedOpen?"OPEN":"CLOSED")+
-           " "+stateStr(curState)+" Fan:"+(fanActive?"ON":"off"));
+           " "+stateStr(curState));
   }
   if(now-lastNPKT>=1000){ lastNPKT=now; readNPK_all(); }
 
   server.handleClient();
 
-  // ── State machine ────────────────────────────────────────────────
-  switch(curState){
+  // ── Manual servo override ─────────────────────────────────────────
+  if(manualServo){
+    s1.write(manSvAngle[0]); s2.write(manSvAngle[1]); s3.write(manSvAngle[2]);
+  }
+
+  // ── State machine — paused while manual servo mode is active ─────
+  if(!manualServo) switch(curState){
     case ST_WAIT:
       if(trig1||trig2){
         s1Target=trig1?0:180;
-        tprint(String("TRIGGER ")+(trig1?"1 (0°)":"2 (180°)")+" received");
+        tprint(String("TRIGGER ")+(trig1?"1 (0°)":"2 (180°)")+" received"+(trig1Wireless||trig2Wireless?" [wireless]":" [hardware]"));
         curState=ST_TRIG; lastDistT=now;
       }
       break;
+
     case ST_TRIG:
       if(!trig1&&!trig2){resetIdle();break;}
+      // Wireless triggers skip ultrasonic — object is already classified
+      if(trig1Wireless||trig2Wireless){
+        tprint("Wireless trigger — skipping ultrasonic");
+        curState=ST_DETECT; stateT=now; break;
+      }
       if(now-lastDistT>=DISTANCE_READ_INTERVAL){
         lastDistT=now; distCm=readUltrasonic();
         if(distCm>=DETECTION_DISTANCE_MIN&&distCm<=DETECTION_DISTANCE_MAX){
@@ -367,34 +379,68 @@ void loop() {
         }
       }
       break;
+
     case ST_DETECT: readReed(); curState=ST_REED_CHECK; break;
+
     case ST_REED_CHECK:
       if(reedOpen){ tprint("ERROR: Reed open — aborting"); curState=ST_REED_ERR; stateT=now; }
       else        { tprint("Reed closed — starting"); curState=ST_S1_SORT; stateT=now; }
       break;
-    case ST_REED_ERR:   if(now-stateT>=5000) resetIdle(); break;
+
+    case ST_REED_ERR: if(now-stateT>=5000) resetIdle(); break;
+
     case ST_S1_SORT:{
       int a=90,step=(s1Target>90)?2:-2;
       while(a!=s1Target){a+=step;if((step>0&&a>s1Target)||(step<0&&a<s1Target))a=s1Target;s1.write(a);delay(15);}
+      s1CurrentAngle=a;
       curState=ST_S1_CLOSE; stateT=now; break;
     }
+
     case ST_S1_CLOSE:
       if(now-stateT>=SERVO_1_CLOSE_DELAY){
-        int a=s1.read(),step=(a<90)?2:-2;
+        int a=s1CurrentAngle,step=(a<90)?2:-2;
         while(a!=90){a+=step;if((step>0&&a>90)||(step<0&&a<90))a=90;s1.write(a);delay(15);}
-        digitalWrite(SSR_RELAY_PIN,HIGH); curState=ST_SSR; stateT=now;
+        s1CurrentAngle=90;
+        // Trigger 1 (pin 35) = paper: skip grinder + servo 2
+        if(trig1){
+          tprint("Trigger 1 (paper) — skipping grinder & servo 2, dumping");
+          curState=ST_S3_DUMP;
+        } else {
+          tprint("Servo 1 closed — activating grinder");
+          digitalWrite(SSR_RELAY_PIN,HIGH);
+          curState=ST_SSR; stateT=now;
+        }
       }
       break;
+
     case ST_SSR:
       if(now-stateT>=SSR_GRINDER_TIME){digitalWrite(SSR_RELAY_PIN,LOW);curState=ST_S2_OPEN;}
       break;
-    case ST_S2_OPEN:{int a=90;while(a<180){a+=2;s2.write(a);delay(15);}delay(1000);curState=ST_S2_CLOSE;break;}
-    case ST_S2_CLOSE:{int a=180;while(a>90){a-=2;s2.write(a);delay(15);}curState=ST_S3_DUMP;break;}
+
+    case ST_S2_OPEN:{
+      int a=90; while(a<180){a+=2;s2.write(a);delay(15);}
+      delay(500); curState=ST_S2_CLOSE; break;
+    }
+
+    case ST_S2_CLOSE:{
+      int a=180; while(a>90){a-=2;s2.write(a);delay(15);}
+      curState=ST_S3_DUMP; break;
+    }
+
     case ST_S3_DUMP:{
-      int a=180;while(a>0){a-=2;s3.write(a);delay(SERVO_3_DELAY);}
-      seqDone++; tprint("Sequence #"+String(seqDone)+" complete");
+      // 5-cycle dump (matches v2 behaviour)
+      for(int cyc=0;cyc<5;cyc++){
+        tprint("Servo 3 dump cycle "+String(cyc+1)+"/5");
+        for(int a=180;a>=0;a-=2){s3.write(a);delay(SERVO_3_DELAY);}
+        s3.write(0); delay(200);
+        for(int a=0;a<=180;a+=2){s3.write(a);delay(SERVO_3_DELAY);}
+        s3.write(180);
+      }
+      seqDone++;
+      tprint("Sequence #"+String(seqDone)+" complete");
       curState=ST_COOL; stateT=now; break;
     }
+
     case ST_COOL: if(now-stateT>=COOLDOWN_TIME) resetIdle(); break;
   }
 
@@ -418,9 +464,6 @@ void startAP() {
 }
 
 void connectWiFi() {
-  // STA is optional — web server and /data work fine on AP alone.
-  // This function is called once at boot and on reconnect; it tries
-  // each network for up to 5 s then gives up and returns immediately.
   const char* ssids[]={WIFI_SSID_1,WIFI_SSID_2,WIFI_SSID_3,WIFI_SSID_4};
   const char* pass[]={WIFI_PASSWORD_1,WIFI_PASSWORD_2,WIFI_PASSWORD_3,WIFI_PASSWORD_4};
   WiFi.config(STA_STATIC_IP,STA_GATEWAY,STA_SUBNET,STA_DNS);
@@ -448,47 +491,39 @@ bool safeTare(unsigned long ms){unsigned long t=millis();while(!scale.is_ready()
 void readSensors() {
   sd.ts=millis();
 
-  // MQ135
   if     (ov.mq135==OVERRIDE_OFF)   {sd.mq135_ok=false;sd.mq135=0;}
   else if(ov.mq135==OVERRIDE_CYCLE) {sd.mq135_ok=true; sd.mq135=fakeCycleInt(300,2800,0);}
   else if(ov.mq135==OVERRIDE_RANGE) {sd.mq135_ok=true; sd.mq135=rv.mq135;}
   else{int r=readADC(MQ135_PIN);sd.mq135_ok=isMQ(r);sd.mq135=sd.mq135_ok?r:0;}
 
-  // MQ2
   if     (ov.mq2==OVERRIDE_OFF)   {sd.mq2_ok=false;sd.mq2=0;}
   else if(ov.mq2==OVERRIDE_CYCLE) {sd.mq2_ok=true; sd.mq2=fakeCycleInt(200,2600,3);}
   else if(ov.mq2==OVERRIDE_RANGE) {sd.mq2_ok=true; sd.mq2=rv.mq2;}
   else{int r=readADC(MQ2_PIN);sd.mq2_ok=isMQ(r);sd.mq2=sd.mq2_ok?r:0;}
 
-  // MQ4
   if     (ov.mq4==OVERRIDE_OFF)   {sd.mq4_ok=false;sd.mq4=0;}
   else if(ov.mq4==OVERRIDE_CYCLE) {sd.mq4_ok=true; sd.mq4=fakeCycleInt(250,2700,6);}
   else if(ov.mq4==OVERRIDE_RANGE) {sd.mq4_ok=true; sd.mq4=rv.mq4;}
   else{int r=readADC(MQ4_PIN);sd.mq4_ok=isMQ(r);sd.mq4=sd.mq4_ok?r:0;}
 
-  // MQ7
   if     (ov.mq7==OVERRIDE_OFF)   {sd.mq7_ok=false;sd.mq7=0;}
   else if(ov.mq7==OVERRIDE_CYCLE) {sd.mq7_ok=true; sd.mq7=fakeCycleInt(150,2400,9);}
   else if(ov.mq7==OVERRIDE_RANGE) {sd.mq7_ok=true; sd.mq7=rv.mq7;}
   else{int r=readADC(MQ7_PIN);sd.mq7_ok=isMQ(r);sd.mq7=sd.mq7_ok?r:0;}
 
-  // Soil — NO CYCLE (moisture only shifts on watering/evaporation, not oscillating)
   if     (ov.soil==OVERRIDE_OFF)   {sd.soil_ok=false;sd.soil=0;}
   else if(ov.soil==OVERRIDE_RANGE) {sd.soil_ok=true; sd.soil=rv.soil;}
   else{int r=readADC(SOIL_MOISTURE_PIN);sd.soil_ok=isActive(r);sd.soil=sd.soil_ok?r:0;}
 
-  // Weight — NO CYCLE (only changes on physical deposit)
   if     (ov.weight==OVERRIDE_OFF)   {sd.weight_ok=false;sd.weight_kg=0;}
   else if(ov.weight==OVERRIDE_RANGE) {sd.weight_ok=true; sd.weight_kg=rv.weight_kg;}
   else{if(scale.is_ready()){float w=scale.get_units(5)/1000.0f;sd.weight_kg=w<0?0:w;sd.weight_ok=true;}else{sd.weight_kg=0;sd.weight_ok=false;}}
 
-  // Reed
   if     (ov.reed==OVERRIDE_OFF)   {sd.reed_ok=false;sd.reed_state=false;}
   else if(ov.reed==OVERRIDE_CYCLE) {sd.reed_ok=true; sd.reed_state=((cycleCounter/5)%2==0);}
   else if(ov.reed==OVERRIDE_RANGE) {sd.reed_ok=true; sd.reed_state=rv.reed_closed;}
   else{sd.reed_state=!reedOpen;sd.reed_ok=true;}
 
-  // DHT
   if     (ov.dht==OVERRIDE_OFF)   {sd.dht_ok=false;sd.temp_c=0;sd.humidity=0;}
   else if(ov.dht==OVERRIDE_CYCLE) {sd.dht_ok=true; sd.temp_c=fakeCycleFloat(22,35,4);sd.humidity=fakeCycleFloat(40,90,8);}
   else if(ov.dht==OVERRIDE_RANGE) {sd.dht_ok=true; sd.temp_c=rv.temp_c;sd.humidity=rv.humidity;}
@@ -498,7 +533,6 @@ void readSensors() {
     else if(!dhtOK||(millis()-lastDHTok>DHT_TIMEOUT_MS)){sd.temp_c=0;sd.humidity=0;sd.dht_ok=false;}
   }
 
-  // pH
   if     (ov.ph==OVERRIDE_OFF)   {sd.ph_ok=false;sd.ph=0;}
   else if(ov.ph==OVERRIDE_CYCLE) {sd.ph_ok=true; sd.ph=fakeCycleFloat(4.5,8.5,14);}
   else if(ov.ph==OVERRIDE_RANGE) {sd.ph_ok=true; sd.ph=rv.ph;}
@@ -530,21 +564,16 @@ float readPH(){
   return constrain(7.0f+((2.5f-v)/0.18f)+PH_OFFSET,0,14);
 }
 
-void updateFan(){
-  bool alarm=(sd.mq135_ok&&sd.mq135>=MQ135_ALARM_THRESHOLD)||
-             (sd.mq2_ok&&sd.mq2>=MQ2_ALARM_THRESHOLD)||
-             (sd.mq4_ok&&sd.mq4>=MQ4_ALARM_THRESHOLD)||
-             (sd.mq7_ok&&sd.mq7>=MQ7_ALARM_THRESHOLD);
-  if(alarm!=fanActive){fanActive=alarm;digitalWrite(GAS_FAN_PIN,alarm?HIGH:LOW);
-    tprint(alarm?"GAS ALARM — fan ON":"Gas cleared — fan OFF");}
-}
-
 // =====================================================================
 // SERVO / MECHANICAL HELPERS
 // =====================================================================
 void setupServos(){s1.attach(SERVO_1_PIN,SERVO_MIN_PULSE,SERVO_MAX_PULSE);s2.attach(SERVO_2_PIN,SERVO_MIN_PULSE,SERVO_MAX_PULSE);s3.attach(SERVO_3_PIN,SERVO_MIN_PULSE,SERVO_MAX_PULSE);}
 void readReed()    {reedOpen=digitalRead(REED_SWITCH_PIN);}
-void readTriggers(){trig1=digitalRead(TRIGGER_1_PIN);trig2=digitalRead(TRIGGER_2_PIN);}
+void readTriggers(){
+  bool hw1=digitalRead(TRIGGER_1_PIN), hw2=digitalRead(TRIGGER_2_PIN);
+  trig1=hw1||trig1Wireless;
+  trig2=hw2||trig2Wireless;
+}
 float readUltrasonic(){
   digitalWrite(ULTRASONIC_TRIG,LOW);delayMicroseconds(2);
   digitalWrite(ULTRASONIC_TRIG,HIGH);delayMicroseconds(10);
@@ -553,9 +582,11 @@ float readUltrasonic(){
   if(d<=0)return -1;float cm=d/29.1f/2.0f;return(cm>MAX_DISTANCE)?-1:cm;
 }
 void resetIdle(){
-  s1.write(90);s2.write(90);s3.write(180);
+  s1.write(90);s1CurrentAngle=90;s2.write(90);s3.write(180);
   digitalWrite(SSR_RELAY_PIN,LOW);
-  trig1=false;trig2=false;s1Target=0;
+  trig1=false;trig2=false;
+  trig1Wireless=false;trig2Wireless=false;
+  s1Target=0;
   curState=ST_WAIT; tprint("Reset — waiting for trigger");
 }
 String stateStr(SystemState s){
@@ -592,7 +623,7 @@ String badge(SensorOverride o){
 }
 
 // =====================================================================
-// SHARED CSS / JS (returned as a string, included in every page head)
+// SHARED CSS
 // =====================================================================
 String sharedCSS() {
   return
@@ -604,24 +635,20 @@ String sharedCSS() {
     "th,td{padding:8px 12px;border:1px solid #1a2a36;text-align:left;vertical-align:middle}"
     "th{background:#0c1820;color:#5a7a8a;font-weight:normal;font-size:11px;letter-spacing:1px;text-transform:uppercase}"
     "tr:nth-child(even){background:#090f14}"
-    // badges
     ".b{padding:2px 8px;border-radius:2px;font-size:11px;font-weight:bold;letter-spacing:1px}"
     ".bliv{background:#0d2b18;color:#2ecc71;border:1px solid #2ecc71}"
     ".boff{background:#2b0d0d;color:#e74c3c;border:1px solid #e74c3c}"
     ".bcyc{background:#2b1f0d;color:#f39c12;border:1px solid #f39c12}"
     ".brng{background:#0d1a2b;color:#3498db;border:1px solid #3498db}"
-    // radio labels
     "label{cursor:pointer;font-size:12px;color:#7a9aaa;margin-right:10px;white-space:nowrap}"
     "label:hover{color:#fff}"
     "input[type=radio]{accent-color:#3498db;cursor:pointer}"
-    // range widget
     ".rw{margin-top:6px;padding:6px 10px;background:#0c1820;border:1px solid #1a3050;border-radius:3px;"
          "display:flex;align-items:center;gap:10px;flex-wrap:wrap}"
     ".rv{color:#3498db;font-weight:bold;font-size:13px;min-width:72px}"
     "input[type=range]{width:150px;accent-color:#3498db;cursor:pointer;vertical-align:middle}"
     "input[type=number]{background:#0c1820;color:#eee;border:1px solid #1a3050;padding:2px 5px;"
                         "border-radius:2px;font-family:inherit;font-size:12px;width:54px}"
-    // toggle
     ".tog{display:flex;gap:0}"
     ".tog button{padding:4px 14px;border:1px solid #1a2a36;background:#0c1820;color:#7a9aaa;"
                  "cursor:pointer;font-family:inherit;font-size:12px}"
@@ -629,9 +656,7 @@ String sharedCSS() {
     ".tog button:last-child{border-radius:0 3px 3px 0}"
     ".tog .ta{background:#0d2b18;color:#2ecc71;border-color:#2ecc71}"
     ".tog .tb{background:#2b0d0d;color:#e74c3c;border-color:#e74c3c}"
-    // status dot
     ".sok{color:#2ecc71;font-weight:bold} .serr{color:#e74c3c;font-weight:bold}"
-    // note box
     ".note{background:#0c1820;border-left:3px solid #f39c12;padding:9px 14px;margin:12px 0;"
            "border-radius:2px;font-size:12px;color:#7a9aaa;line-height:1.7}"
     ".ipb{background:#0c1820;border:1px solid #1a2a36;border-radius:3px;padding:9px 14px;"
@@ -649,7 +674,7 @@ String sharedCSS() {
 }
 
 // =====================================================================
-// WEB — /  (status dashboard)
+// WEB — /
 // =====================================================================
 String sensorRow(const String& l, const String& v, bool ok){
   String c=ok?"#2ecc71":"#e74c3c";
@@ -668,7 +693,11 @@ void handleRoot(){
      "</div>";
   h+="<p>State: <b>"+stateStr(curState)+"</b> &nbsp;|&nbsp; Sequences: "+String(seqDone)+
      " &nbsp;|&nbsp; Reed: "+(reedOpen?"<span class='serr'>OPEN</span>":"<span class='sok'>CLOSED</span>")+
-     " &nbsp;|&nbsp; Fan: <span class='"+(fanActive?"serr":"sok")+"'>"+(fanActive?"ON":"off")+"</span></p>";
+     " &nbsp;|&nbsp; Fan: <span class='sok'>always on</span></p>";
+  if(lastClassification.length()>0){
+    h+="<p>Last classification: <b>"+lastClassification+"</b>"
+       " (prob: "+String(lastClassProb,2)+", trigger: "+String(lastClassTrigger)+")</p>";
+  }
   h+="<a class='btn' href='/debug'>Debug Panel</a>"
      "<a class='btn' href='/terminal'>Terminal</a>"
      "<a class='btn' href='/data'>JSON /data</a>";
@@ -691,20 +720,11 @@ void handleRoot(){
 }
 
 // =====================================================================
-// WEB — /debug  (override control panel)
+// WEB — /debug
 // =====================================================================
-// debugRow builds one table row.
-// Layout of the Override Controls cell:
-//
-//   O Live  O Off  [O Cycle]  O Range  ——o—— 42  (slider shown when Range selected)
-//
-// The slider / toggle appears immediately beneath the radios when RANGE is active.
-// JS handles live updates (no page reload on slider drag; page reloads on radio change).
-
 String debugRow(const String& key, const String& lbl,
                 const String& lv, bool lok, SensorOverride mode) {
   String sc=lok?"#2ecc71":"#e74c3c";
-  // radio checked states
   String lc=(mode==OVERRIDE_LIVE)  ?" checked":"";
   String oc=(mode==OVERRIDE_OFF)   ?" checked":"";
   String cc=(mode==OVERRIDE_CYCLE) ?" checked":"";
@@ -713,18 +733,14 @@ String debugRow(const String& key, const String& lbl,
   String radios=
     "<label><input type='radio' name='"+key+"' value='live'"+lc+" onchange='chMode(this)'> Live</label>"
     "<label><input type='radio' name='"+key+"' value='off'"+oc+" onchange='chMode(this)'> Off</label>";
-
   if(hasCycle(key))
     radios+="<label><input type='radio' name='"+key+"' value='cycle'"+cc+" onchange='chMode(this)'> Cycle</label>";
-
   radios+="<label><input type='radio' name='"+key+"' value='range'"+rc+" onchange='chMode(this)'> Range</label>";
 
-  // Range widget — visible only when mode==RANGE
   String rw="";
   String disp=(mode==OVERRIDE_RANGE)?"":"display:none";
 
   if(key=="reed"){
-    // Boolean toggle — CLOSED (green, true) / OPEN (red, false)
     String ca=rv.reed_closed?" ta":"", cb=rv.reed_closed?"":" tb";
     rw="<div class='rw tog' id='rw_reed' style='"+disp+"'>"
        "<button type='button' class='"+ca+"' onclick='setReed(true)'>CLOSED</button>"
@@ -771,7 +787,6 @@ String debugRow(const String& key, const String& lbl,
        " <span style='color:#5a7a8a;font-size:11px'>mg/kg</span>"
        "</div>";
   } else {
-    // MQ sensors (mq135, mq2, mq4, mq7)
     int cur=(key=="mq135")?rv.mq135:(key=="mq2")?rv.mq2:(key=="mq4")?rv.mq4:rv.mq7;
     String vkey=key+"_val";
     rw="<div class='rw' id='rw_"+key+"' style='"+disp+"'>"
@@ -794,23 +809,26 @@ String debugRow(const String& key, const String& lbl,
 void handleDebug(){
   String h="<!DOCTYPE html><html><head><meta charset='UTF-8'>"
     "<title>NutriBin Debug</title>"+sharedCSS()+
-    // JS: chMode posts the mode change and reloads; sv updates display only; post sends a value silently
     "<script>"
     "function chMode(el){"
     "  var fd=new FormData();fd.append(el.name,el.value);"
     "  fetch('/debug/set',{method:'POST',body:fd}).then(()=>location.reload());"
     "}"
-    // sv(inputEl, spanPrefix, unit, decimals)
-    // span id convention: prefix_key  e.g. rv_mq135, rvt_dht, rvh_dht
     "function sv(el,pre,unit,dec){"
-    "  var key=el.closest('tr').querySelector('b').textContent;"  // unused — we use id
-    // find the span sibling right after this input
     "  var sp=el.nextElementSibling;"
     "  if(sp)sp.textContent=parseFloat(el.value).toFixed(dec)+(unit?' '+unit:'');"
     "}"
     "function post(k,v){"
     "  var fd=new FormData();fd.append(k,v);"
     "  fetch('/debug/set',{method:'POST',body:fd});"
+    "}"
+    "function toggleManual(on){"
+    "  var fd=new FormData();fd.append('manual_servo',on?'1':'0');"
+    "  fetch('/servo/set',{method:'POST',body:fd}).then(()=>location.reload());"
+    "}"
+    "function setSv(idx,ang){"
+    "  var fd=new FormData();fd.append('sv'+idx,ang);"
+    "  fetch('/servo/set',{method:'POST',body:fd});"
     "}"
     "function setReed(closed){"
     "  var btns=document.querySelectorAll('#rw_reed button');"
@@ -829,12 +847,11 @@ void handleDebug(){
   h+="<div class='note'>"
      "<b style='color:#2ecc71'>LIVE</b> — real hardware &nbsp;|&nbsp; "
      "<b style='color:#e74c3c'>OFF</b> — sensor offline, zeros in JSON &nbsp;|&nbsp; "
-     "<b style='color:#f39c12'>CYCLE</b> — oscillating fake data (not available for weight &amp; soil) &nbsp;|&nbsp; "
+     "<b style='color:#f39c12'>CYCLE</b> — oscillating fake data &nbsp;|&nbsp; "
      "<b style='color:#3498db'>RANGE</b> — slider/toggle sets the value sent in JSON"
      "</div>";
 
   h+="<table><tr><th>Sensor</th><th>Live value</th><th>HW</th><th>Mode</th><th>Override controls</th></tr>";
-
   h+=debugRow("npk","NPK (N/P/K)",
     String(sd.nitrogen)+"/"+String(sd.phosphorus)+"/"+String(sd.potassium)+" mg/kg",
     sd.npk_ok,ov.npk);
@@ -849,6 +866,52 @@ void handleDebug(){
   h+=debugRow("mq7","MQ7 (CO)",String(sd.mq7),                        sd.mq7_ok,    ov.mq7);
   h+=debugRow("reed","Reed switch",sd.reed_state?"CLOSED":"OPEN",     sd.reed_ok,   ov.reed);
   h+="</table>";
+
+  // ── Manual Servo Control ──────────────────────────────────────────
+  String manChk = manualServo?" checked":"";
+  h+="<h2>Manual Servo Control</h2>";
+  h+="<div class='note'>"
+     "Enable manual mode to directly position each servo. "
+     "<b style='color:#e74c3c'>The sorting state machine pauses while this is active.</b>"
+     "</div>";
+  h+="<div style='background:#0c1820;border:1px solid #1a2a36;border-radius:3px;padding:14px;max-width:1060px'>";
+  h+="<div style='margin-bottom:12px;display:flex;align-items:center;gap:12px'>"
+     "<label style='font-size:13px;color:#ecf0f1'><input type='checkbox'"+manChk+
+     " onchange='toggleManual(this.checked)'> &nbsp; Enable manual servo mode</label>"
+     "<span style='font-size:11px;color:"+String(manualServo?"#e74c3c":"#3d6b50")+"'>"
+     +(manualServo?"&#9888; STATE MACHINE PAUSED":"&#10003; State machine running")+
+     "</span></div>";
+  const char* svNames[]={"Servo 1 (Sorting gate — 0° / 90° / 180°)",
+                          "Servo 2 (Drop gate — 90°=closed 180°=open)",
+                          "Servo 3 (Dump chute — 0°=dump 180°=hold)"};
+  for(int i=0;i<3;i++){
+    int cur=manSvAngle[i];
+    String dis=manualServo?"":"opacity:0.35;pointer-events:none";
+    h+="<div style='margin-bottom:10px;"+dis+"'>";
+    h+="<span style='font-size:12px;color:#7a9aaa'>"+String(svNames[i])+"</span><br>";
+    h+="<div class='rw' style='margin-top:4px'>"
+       "<input type='range' min='0' max='180' step='1' value='"+String(cur)+"'"
+       " oninput='this.nextElementSibling.textContent=this.value+\"°\"'"
+       " onchange='setSv("+String(i)+",this.value)'>"
+       "<span class='rv'>"+String(cur)+"°</span>"
+       "</div></div>";
+  }
+  h+="</div>";
+
+  // ── Classify status ───────────────────────────────────────────────
+  h+="<h2>Last Classification</h2>";
+  h+="<div class='ipb'>";
+  if(lastClassification.length()>0){
+    h+="Label: <b>"+lastClassification+"</b> &nbsp; "
+       "Probability: <b>"+String(lastClassProb,2)+"</b> &nbsp; "
+       "Trigger: <b>"+String(lastClassTrigger)+"</b><br>"
+       "<span style='font-size:11px;color:#5a7a8a'>"
+       "POST JSON to <code>/classify</code>: {\"classification\":\"paper\",\"trigger\":1,\"probability\":0.95}"
+       "</span>";
+  } else {
+    h+="No classification received yet. POST to <code>/classify</code>.";
+  }
+  h+="</div>";
 
   h+="<h2>Quick Actions</h2>"
      "<form method='POST' action='/debug/set' style='display:inline'>"
@@ -870,7 +933,6 @@ void handleDebugSet(){
         OVERRIDE_LIVE,OVERRIDE_LIVE,OVERRIDE_LIVE,OVERRIDE_LIVE,OVERRIDE_LIVE};
     tprint("DEBUG: all reset to LIVE");
   } else {
-    // Mode selectors
     if(server.hasArg("npk"))    ov.npk   =strToOv(server.arg("npk"));
     if(server.hasArg("weight")) ov.weight=strToOv(server.arg("weight"));
     if(server.hasArg("dht"))    ov.dht   =strToOv(server.arg("dht"));
@@ -882,7 +944,6 @@ void handleDebugSet(){
     if(server.hasArg("mq7"))    ov.mq7   =strToOv(server.arg("mq7"));
     if(server.hasArg("reed"))   ov.reed  =strToOv(server.arg("reed"));
 
-    // Range value setters — constrained to physical ranges
     if(server.hasArg("ph_val"))    rv.ph         =constrain(server.arg("ph_val").toFloat(),0.0f,14.0f);
     if(server.hasArg("temp_val"))  rv.temp_c     =constrain(server.arg("temp_val").toFloat(),-10.0f,60.0f);
     if(server.hasArg("hum_val"))   rv.humidity   =constrain(server.arg("hum_val").toFloat(),0.0f,100.0f);
@@ -897,61 +958,140 @@ void handleDebugSet(){
     if(server.hasArg("mq7_val"))   rv.mq7        =constrain(server.arg("mq7_val").toInt(),0,4095);
     if(server.hasArg("reed_bool")) rv.reed_closed=(server.arg("reed_bool")=="1");
   }
-  // PRG redirect — prevents re-POST on browser refresh
   server.sendHeader("Location","/debug"); server.send(303);
 }
 
 // =====================================================================
-// WEB — /data  (JSON endpoint for fetching devices)
+// WEB — /data
 // =====================================================================
 void handleData(){
-  StaticJsonDocument<1024> doc;
-  doc["nitrogen"]        =sd.nitrogen;
-  doc["phosphorus"]      =sd.phosphorus;
-  doc["potassium"]       =sd.potassium;
-  doc["temperature"]     =sd.temp_c;
-  doc["humidity"]        =sd.humidity;
-  doc["soil_moisture"]   =sd.soil;
-  doc["weight_kg"]       =sd.weight_kg;
-  doc["air_quality"]     =sd.mq135;
-  doc["combustible_gases"]=sd.mq2;
-  doc["methane"]         =sd.mq4;
-  doc["carbon_monoxide"] =sd.mq7;
-  doc["ph"]              =sd.ph;
-  doc["reed_switch"]     =sd.reed_state;
-  doc["gas_fan_active"]  =fanActive;
-  doc["servo_state"]     =stateStr(curState);
-  doc["sequences_done"]  =seqDone;
-  doc["uptime_ms"]       =millis();
-  doc["ap_ip"]           ="192.168.4.1";
-  doc["sta_ip"]          =WiFi.localIP().toString();
-  doc["sta_connected"]   =(WiFi.status()==WL_CONNECTED);
-  doc["npk_ok"]          =sd.npk_ok;
-  doc["weight_ok"]       =sd.weight_ok;
-  doc["mq135_ok"]        =sd.mq135_ok;
-  doc["mq2_ok"]          =sd.mq2_ok;
-  doc["mq4_ok"]          =sd.mq4_ok;
-  doc["mq7_ok"]          =sd.mq7_ok;
-  doc["soil_ok"]         =sd.soil_ok;
-  doc["dht_ok"]          =sd.dht_ok;
-  doc["reed_ok"]         =sd.reed_ok;
-  doc["ph_ok"]           =sd.ph_ok;
-  doc["ov_npk"]          =ovStr(ov.npk);
-  doc["ov_weight"]       =ovStr(ov.weight);
-  doc["ov_dht"]          =ovStr(ov.dht);
-  doc["ov_ph"]           =ovStr(ov.ph);
-  doc["ov_soil"]         =ovStr(ov.soil);
-  doc["ov_mq135"]        =ovStr(ov.mq135);
-  doc["ov_mq2"]          =ovStr(ov.mq2);
-  doc["ov_mq4"]          =ovStr(ov.mq4);
-  doc["ov_mq7"]          =ovStr(ov.mq7);
-  doc["ov_reed"]         =ovStr(ov.reed);
+  StaticJsonDocument<1200> doc;
+  doc["nitrogen"]          =sd.nitrogen;
+  doc["phosphorus"]        =sd.phosphorus;
+  doc["potassium"]         =sd.potassium;
+  doc["temperature"]       =sd.temp_c;
+  doc["humidity"]          =sd.humidity;
+  doc["soil_moisture"]     =sd.soil;
+  doc["weight_kg"]         =sd.weight_kg;
+  doc["air_quality"]       =sd.mq135;
+  doc["combustible_gases"] =sd.mq2;
+  doc["methane"]           =sd.mq4;
+  doc["carbon_monoxide"]   =sd.mq7;
+  doc["ph"]                =sd.ph;
+  doc["reed_switch"]       =sd.reed_state;
+  doc["gas_fan_active"]    =true;   // always on
+  doc["servo_state"]       =stateStr(curState);
+  doc["sequences_done"]    =seqDone;
+  doc["uptime_ms"]         =millis();
+  doc["ap_ip"]             ="192.168.4.1";
+  doc["sta_ip"]            =WiFi.localIP().toString();
+  doc["sta_connected"]     =(WiFi.status()==WL_CONNECTED);
+  doc["npk_ok"]            =sd.npk_ok;
+  doc["weight_ok"]         =sd.weight_ok;
+  doc["mq135_ok"]          =sd.mq135_ok;
+  doc["mq2_ok"]            =sd.mq2_ok;
+  doc["mq4_ok"]            =sd.mq4_ok;
+  doc["mq7_ok"]            =sd.mq7_ok;
+  doc["soil_ok"]           =sd.soil_ok;
+  doc["dht_ok"]            =sd.dht_ok;
+  doc["reed_ok"]           =sd.reed_ok;
+  doc["ph_ok"]             =sd.ph_ok;
+  doc["ov_npk"]            =ovStr(ov.npk);
+  doc["ov_weight"]         =ovStr(ov.weight);
+  doc["ov_dht"]            =ovStr(ov.dht);
+  doc["ov_ph"]             =ovStr(ov.ph);
+  doc["ov_soil"]           =ovStr(ov.soil);
+  doc["ov_mq135"]          =ovStr(ov.mq135);
+  doc["ov_mq2"]            =ovStr(ov.mq2);
+  doc["ov_mq4"]            =ovStr(ov.mq4);
+  doc["ov_mq7"]            =ovStr(ov.mq7);
+  doc["ov_reed"]           =ovStr(ov.reed);
+  // Classification passthrough
+  doc["last_classification"]=lastClassification;
+  doc["last_class_prob"]    =lastClassProb;
+  doc["last_class_trigger"] =lastClassTrigger;
+  // Wireless trigger state
+  doc["trig1_wireless"]    =trig1Wireless;
+  doc["trig2_wireless"]    =trig2Wireless;
   String out; serializeJson(doc,out);
   server.send(200,"application/json",out);
 }
 
 // =====================================================================
-// WEB — /terminal  (live log viewer)
+// WEB — /servo/set
+// =====================================================================
+void handleServoSet(){
+  if(server.hasArg("manual_servo")){
+    manualServo=(server.arg("manual_servo")=="1");
+    if(!manualServo){
+      manSvAngle[0]=90; manSvAngle[1]=90; manSvAngle[2]=180;
+      resetIdle();
+      tprint("Manual servo: DISABLED — state machine resumed");
+    } else {
+      manSvAngle[0]=s1.read(); manSvAngle[1]=s2.read(); manSvAngle[2]=s3.read();
+      tprint("Manual servo: ENABLED — state machine paused");
+    }
+  }
+  if(server.hasArg("sv0")){manSvAngle[0]=constrain(server.arg("sv0").toInt(),0,180);s1.write(manSvAngle[0]);tprint("SV1 -> "+String(manSvAngle[0])+"°");}
+  if(server.hasArg("sv1")){manSvAngle[1]=constrain(server.arg("sv1").toInt(),0,180);s2.write(manSvAngle[1]);tprint("SV2 -> "+String(manSvAngle[1])+"°");}
+  if(server.hasArg("sv2")){manSvAngle[2]=constrain(server.arg("sv2").toInt(),0,180);s3.write(manSvAngle[2]);tprint("SV3 -> "+String(manSvAngle[2])+"°");}
+  server.sendHeader("Location","/debug"); server.send(303);
+}
+
+// =====================================================================
+// WEB — /classify  (POST JSON from ML classifier)
+// =====================================================================
+// Expected JSON body:
+//   { "classification": "paper", "trigger": 1, "probability": 0.95 }
+//
+// trigger 1 → pin 35 path (paper)   → servo 1 to 0°, skip grinder
+// trigger 2 → pin 34 path (organic) → servo 1 to 180°, full grind + dump
+// =====================================================================
+void handleClassify(){
+  if(server.method()!=HTTP_POST){
+    server.send(405,"application/json","{\"error\":\"Method not allowed\"}");
+    return;
+  }
+  if(!server.hasArg("plain")){
+    server.send(400,"application/json","{\"error\":\"No JSON body\"}");
+    return;
+  }
+  StaticJsonDocument<256> doc;
+  DeserializationError err=deserializeJson(doc,server.arg("plain"));
+  if(err){
+    tprint("Classify: JSON parse error — "+String(err.c_str()));
+    server.send(400,"application/json","{\"error\":\"Invalid JSON\"}");
+    return;
+  }
+
+  String cls   = doc["classification"] | "";
+  int    trig  = doc["trigger"]        | 0;
+  float  prob  = doc["probability"]    | 0.0f;
+
+  tprint("CLASSIFY: "+cls+" prob="+String(prob,2)+" trigger="+String(trig));
+
+  if(trig==1){
+    trig1Wireless=true; trig2Wireless=false;
+    tprint("Wireless TRIGGER 1 armed (paper path — skip grinder)");
+  } else if(trig==2){
+    trig1Wireless=false; trig2Wireless=true;
+    tprint("Wireless TRIGGER 2 armed (organic path — grind + dump)");
+  } else {
+    server.send(400,"application/json","{\"error\":\"trigger must be 1 or 2\"}");
+    return;
+  }
+
+  // Store for /data and debug panel display
+  lastClassification = cls;
+  lastClassProb      = prob;
+  lastClassTrigger   = trig;
+
+  server.send(200,"application/json",
+    "{\"status\":\"ok\",\"classification\":\""+cls+"\",\"trigger\":"+String(trig)+"}");
+}
+
+// =====================================================================
+// WEB — /terminal
 // =====================================================================
 void handleTerminal(){
   String h="<!DOCTYPE html><html><head><meta charset='UTF-8'>"
@@ -983,7 +1123,7 @@ void handleTerminal(){
     "   .replace(/\\b(ERROR|ALARM|FAILED|TIMEOUT|OPEN|FATAL)\\b/g,'<span class=\"err\">$1</span>')"
     "   .replace(/\\b(WARN|WARNING)\\b/g,'<span class=\"wrn\">$1</span>')"
     "   .replace(/\\b(OK|connected|Ready|complete|cleared|joined)\\b/gi,'<span class=\"ok\">$1</span>')"
-    "   .replace(/\\b(STA|AP|DEBUG|POST|NPK)\\b/g,'<span class=\"inf\">$1</span>');"
+    "   .replace(/\\b(STA|AP|DEBUG|POST|NPK|CLASSIFY)\\b/g,'<span class=\"inf\">$1</span>');"
     "}"
     "function poll(){"
     "  fetch('/terminal/json').then(r=>r.text()).then(t=>{"
@@ -1004,7 +1144,7 @@ void handleTerminal(){
     "<span>state: <b>"+stateStr(curState)+"</b></span>"
     "<span>seq: <b>"+String(seqDone)+"</b></span>"
     "<span>reed: <b>"+(reedOpen?"<span class='serr'>OPEN</span>":"<span class='sok'>CLOSED</span>")+"</b></span>"
-    "<span>fan: <b class='"+(fanActive?"serr":"sok")+"'>"+(fanActive?"ON":"off")+"</b></span>"
+    "<span>fan: <b class='sok'>always on</b></span>"
     "<span>STA: <b class='"+(WiFi.status()==WL_CONNECTED?"sok":"serr")+"'>"+(WiFi.status()==WL_CONNECTED?"joined":"ap-only")+"</b></span>"
     "</div>"
     "<div class='tw'><div id='log'>"+tlogDump()+"<span class='cur'></span></div></div>"
