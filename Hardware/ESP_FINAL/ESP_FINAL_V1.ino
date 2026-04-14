@@ -1,27 +1,28 @@
-// nutribin_v3.cpp
-// NutriBin Firmware — ESP32
-// VERSION 3 — Sensors + Debug Override Panel + Manual Servo Control
-//             + Wireless Classification Trigger (/classify POST)
-//             + Fan always on (no NPN alarm logic)
+// nutribin_v4.cpp
+// NutriBin Firmware — ESP32 (30-pin)
+// VERSION 4 — Updated pinout + adjustable dump duration + corrected servo 3 sweep
 //
-// Architecture:
-//   The ESP32 acts as a data-serving node only — it does NOT upload to any backend.
-//   It reads sensors, serves them as JSON at /data, and hosts a debug panel at /debug.
-//   Any device (Arduino, laptop, phone, ML classifier) can:
-//     GET  http://192.168.4.1/data          — read sensor JSON
-//     POST http://192.168.4.1/classify      — send classification trigger
+// Servo 3 dump: sweeps 0°→180°→0° for DUMP_CYCLE_COUNT full round trips.
+// Duration is adjustable via /debug/set (dump_duration POST arg) or the
+// debug panel slider — range 1–60 s, default 10 s.
+// The sweep speed auto-scales to fill the requested duration.
 //
-//   AP  (always-on) : http://192.168.4.1        — NutriBin-Debug WiFi, no internet needed
-//   STA (optional)  : http://192.168.1.50       — joins home router if available, same routes
+// Pin conflict fixes vs v3:
+//   SSR_RELAY_PIN 32  — MQ135 moved off 32  → 15
+//   REED_SWITCH_PIN 25 — MQ2 moved off 25   → 2
+//   NPK_RE 4          — DHT moved off 4     → 22
+//   ULTRASONIC_ECHO 33 — SOIL moved off 33  → 26 (MQ4 bumped to 15, chain resolved below)
 //
-// Override modes per sensor (radio buttons in /debug):
-//   LIVE  — reads real hardware
-//   OFF   — reports sensor offline, zeros in JSON
-//   CYCLE — fake oscillating values (MQ sensors, NPK, DHT, pH only — not weight/soil)
-//   RANGE — operator slider / toggle replaces sensor; value held until changed
-//
-// Routes: /   /debug   /debug/set   /data   /terminal   /terminal/json
-//         /servo/set   /classify
+// Final pin assignments (30-pin safe GPIOs only):
+//   SERVO_1        13   SERVO_2        14   SERVO_3        27
+//   ULTRASONIC_TRIG 23  ULTRASONIC_ECHO 33
+//   TRIGGER_1      35   TRIGGER_2      34
+//   REED_SWITCH    25   SSR_RELAY      32   GAS_FAN        19
+//   NPK_RE          4   NPK_DE          5   NPK_RX         16   NPK_TX 17
+//   LOADCELL_DOUT  18   LOADCELL_SCK   21
+//   DHT            22
+//   MQ135          15   MQ2             2   MQ4            26   MQ7    36
+//   SOIL           12   PH             39
 // =====================================================================
 
 #include <ESP32Servo.h>
@@ -35,35 +36,38 @@
 // =====================================================================
 // PIN DEFINITIONS
 // =====================================================================
-#define SERVO_1_PIN        13
-#define SERVO_2_PIN        14
-#define SERVO_3_PIN        27
+#define SERVO_1_PIN         13
+#define SERVO_2_PIN         14
+#define SERVO_3_PIN         27
 
-#define ULTRASONIC_TRIG    12
-#define ULTRASONIC_ECHO    33
-#define TRIGGER_1_PIN      35
-#define TRIGGER_2_PIN      34
-#define REED_SWITCH_PIN    25
-#define SSR_RELAY_PIN      32
+#define ULTRASONIC_TRIG     23
+#define ULTRASONIC_ECHO     33
 
-#define NPK_RE             4
-#define NPK_DE             5
-#define NPK_RX             16
-#define NPK_TX             17
+#define TRIGGER_1_PIN       35
+#define TRIGGER_2_PIN       34
 
-#define LOADCELL_DOUT      18
-#define LOADCELL_SCK       21
+#define REED_SWITCH_PIN     25
+#define SSR_RELAY_PIN       32
+#define GAS_FAN_PIN         19
 
-#define MQ135_PIN          3
-#define MQ2_PIN            0
-#define MQ4_PIN            26
-#define MQ7_PIN            36
-#define SOIL_MOISTURE_PIN  2
+#define NPK_RE               4
+#define NPK_DE               5
+#define NPK_RX              16
+#define NPK_TX              17
 
-#define GAS_FAN_PIN        19
-#define DHT_PIN            15
-#define DHT_TYPE           DHT22
-#define PH_SENSOR_PIN      39
+#define LOADCELL_DOUT       18
+#define LOADCELL_SCK        21
+
+#define DHT_PIN             22
+#define DHT_TYPE            DHT22
+
+// Analog pins — all conflict-free
+#define MQ135_PIN           15   // was 32 (conflicted with SSR)
+#define MQ2_PIN              2   // was 25 (conflicted with REED)
+#define MQ4_PIN             26
+#define MQ7_PIN             36
+#define SOIL_MOISTURE_PIN   12   // was 33 (conflicted with ECHO)
+#define PH_SENSOR_PIN       39
 
 // =====================================================================
 // CONSTANTS
@@ -79,7 +83,6 @@
 
 #define SERVO_1_CLOSE_DELAY      3000
 #define SSR_GRINDER_TIME         5000
-#define SERVO_3_DELAY            500
 #define DISTANCE_READ_INTERVAL   200
 #define COOLDOWN_TIME            2000
 
@@ -96,6 +99,13 @@
 #define DHT_TIMEOUT_MS           3000
 #define HX711_TARE_TIMEOUT_MS    3000
 #define NPK_CONFIRM_READS        2
+
+// ── Dump cycle defaults ───────────────────────────────────────────────
+// DUMP_DURATION_S  : total seconds servo 3 spends sweeping back and forth
+// DUMP_STEP_DELAY  : ms per 1° step — auto-calculated from duration, but
+//                    clamped to DUMP_STEP_MIN_MS so the servo isn't brutally fast
+#define DUMP_DURATION_DEFAULT_S  10      // adjustable via debug panel (1–60 s)
+#define DUMP_STEP_MIN_MS         20       // fastest allowed step (≈ 720 ms full sweep)
 
 // =====================================================================
 // NETWORK CONFIG
@@ -147,9 +157,7 @@ struct RangeVals {
 };
 RangeVals rv;
 
-bool hasCycle(const String& k) {
-  return !(k == "weight" || k == "soil");
-}
+bool hasCycle(const String& k) { return !(k == "weight" || k == "soil"); }
 
 unsigned long cycleCounter = 0;
 
@@ -165,7 +173,21 @@ float fakeCycleFloat(float lo, float hi, int phase) {
 }
 
 // =====================================================================
-// TERMINAL LOG RING BUFFER
+// DUMP DURATION (runtime-adjustable)
+// =====================================================================
+// dumpDurationS  — total seconds for the full back-and-forth sweep
+// stepDelayMs    — derived: (durationS * 1000) / (180 steps * 2 directions)
+//                  clamped to DUMP_STEP_MIN_MS
+int dumpDurationS = DUMP_DURATION_DEFAULT_S;
+
+int calcStepDelay(int durS) {
+  // 180° each way = 180 steps each way × 2 = 360 steps per round trip
+  int ms = (durS * 1000) / 360;
+  return max(ms, DUMP_STEP_MIN_MS);
+}
+
+// =====================================================================
+// TERMINAL LOG
 // =====================================================================
 #define TERM_LINES 48
 #define TERM_WIDTH 128
@@ -208,20 +230,30 @@ enum SystemState {
 };
 
 Servo s1, s2, s3;
-SystemState  curState      = ST_WAIT;
-bool         reedOpen      = false;
-bool         trig1         = false, trig2=false;
-bool         trig1Wireless = false, trig2Wireless = false;  // from /classify
-float        distCm        = 0;
-int          s1Target      = 0;
+SystemState  curState       = ST_WAIT;
+bool         reedOpen       = false;
+bool         trig1          = false, trig2=false;
+bool         trig1Wireless  = false, trig2Wireless=false;
+float        distCm         = 0;
+int          s1Target       = 0;
 int          s1CurrentAngle = 90;
-int          seqDone       = 0;
+int          seqDone        = 0;
 
-// Manual servo override
-bool manualServo   = false;
-int  manSvAngle[3] = {90, 90, 180};
+bool manualServo    = false;
+int  manSvAngle[3]  = {90, 90, 0};  // s3 idles at 0° (chute closed)
+int  manSvWritten[3]= {-1, -1, -1}; // last angle actually sent; -1 = never written
+                                     // Only write when angle changes to avoid
+                                     // hammering the PWM timer and causing jitter.
 
-// Last classification result (for /data endpoint)
+// Ultrasonic override — lets the debug panel fake or disable distance readings
+// so the state machine can be tested without a physical object in range.
+// LIVE  — real HC-SR04 reading
+// OFF   — always returns -1 (no object detected, trigger stays in ST_TRIG)
+// RANGE — operator sets a fixed cm value; if in-range the machine proceeds
+enum UltraOverride { ULTRA_LIVE=0, ULTRA_OFF=1, ULTRA_RANGE=2 };
+UltraOverride ultraMode = ULTRA_LIVE;
+float ultraRangeCm      = 7.0f;   // fake distance used in RANGE mode (default in-range)
+
 String lastClassification = "";
 float  lastClassProb      = 0.0f;
 int    lastClassTrigger   = 0;
@@ -239,7 +271,8 @@ struct SensorData {
   int   mq135, mq2, mq4, mq7, soil;
   float temp_c, humidity, ph;
   bool  reed_state;
-  bool  npk_ok, weight_ok, mq135_ok, mq2_ok, mq4_ok, mq7_ok, soil_ok, dht_ok, reed_ok, ph_ok;
+  bool  npk_ok, weight_ok, mq135_ok, mq2_ok, mq4_ok, mq7_ok,
+        soil_ok, dht_ok, reed_ok, ph_ok;
   unsigned long ts;
 } sd;
 
@@ -258,8 +291,7 @@ byte npkBuf[7];
 // =====================================================================
 void connectWiFi(); void startAP();
 void setupServos(); void readReed(); void readTriggers();
-float readUltrasonic(); void resetIdle();
-String stateStr(SystemState s);
+float readUltrasonic(); void resetIdle(); String stateStr(SystemState s);
 void readSensors(); void readNPK_all(); int readNPKcmd(const byte* cmd);
 float readPH(); int readADC(int pin, int n=5);
 bool isActive(int v); bool isMQ(int v);
@@ -272,27 +304,27 @@ String badge(SensorOverride o);
 String sensorRow(const String& lbl, const String& val, bool ok);
 String debugRow(const String& key, const String& lbl,
                 const String& liveval, bool liveok, SensorOverride mode);
+void runDumpSweep();
 
 // =====================================================================
 // SETUP
 // =====================================================================
 void setup() {
   Serial.begin(SERIAL_BAUD); delay(800);
-  tprint("NutriBin v3 — Sensor Hub + AP Data Server + Manual Servo + Classify");
-  tprint("Fan: always on. No backend upload — fetch /data to read sensors.");
+  tprint("NutriBin v4 — 30-pin ESP32, updated pins, adjustable dump");
 
   pinMode(TRIGGER_1_PIN,INPUT); pinMode(TRIGGER_2_PIN,INPUT);
   pinMode(REED_SWITCH_PIN,INPUT_PULLUP);
   pinMode(ULTRASONIC_TRIG,OUTPUT); pinMode(ULTRASONIC_ECHO,INPUT);
   pinMode(SSR_RELAY_PIN,OUTPUT);
-
-  // Fan always on
   pinMode(GAS_FAN_PIN,OUTPUT);
   digitalWrite(GAS_FAN_PIN,HIGH);
-  tprint("Gas fan: ON (always-on mode)");
+  tprint("Gas fan: ON (always-on)");
 
   setupServos();
-  s1.write(90); s1CurrentAngle=90; s2.write(90); s3.write(180);
+  s1.write(90); s1CurrentAngle=90;
+  s2.write(90);
+  s3.write(0);   // s3 idles at 0° — chute closed position
 
   pinMode(NPK_RE,OUTPUT); pinMode(NPK_DE,OUTPUT);
   digitalWrite(NPK_RE,LOW); digitalWrite(NPK_DE,LOW);
@@ -311,20 +343,57 @@ void setup() {
   startAP();
   connectWiFi();
 
-  server.on("/",                    handleRoot);
-  server.on("/debug",  HTTP_GET,    handleDebug);
-  server.on("/debug/set", HTTP_POST,handleDebugSet);
-  server.on("/data",   HTTP_GET,    handleData);
-  server.on("/terminal", HTTP_GET,  handleTerminal);
+  server.on("/",                     handleRoot);
+  server.on("/debug",   HTTP_GET,    handleDebug);
+  server.on("/debug/set", HTTP_POST, handleDebugSet);
+  server.on("/data",    HTTP_GET,    handleData);
+  server.on("/terminal", HTTP_GET,   handleTerminal);
   server.on("/terminal/json", HTTP_GET, handleTerminalJson);
-  server.on("/servo/set", HTTP_POST,handleServoSet);
-  server.on("/classify",  HTTP_POST,handleClassify);
+  server.on("/servo/set", HTTP_POST, handleServoSet);
+  server.on("/classify",  HTTP_POST, handleClassify);
   server.begin();
 
-  tprint("AP  always-on : http://192.168.4.1");
-  tprint("STA if joined : http://" + WiFi.localIP().toString());
-  tprint("Routes: /  /debug  /data  /terminal  /classify");
+  tprint("AP  : http://192.168.4.1");
+  tprint("STA : http://" + WiFi.localIP().toString());
+  tprint("Dump duration: "+String(dumpDurationS)+" s (step delay: "+String(calcStepDelay(dumpDurationS))+" ms)");
   tprint("Ready.");
+}
+
+// =====================================================================
+// DUMP SWEEP  — the core back-and-forth motion of servo 3
+// =====================================================================
+// Sweeps 0°→180°→0° once per call.
+// Step delay is derived from dumpDurationS so the full trip fills
+// roughly the requested time.  Call this in a loop (or once) from ST_S3_DUMP.
+// Blocking — state machine is paused during sweep (same as v1 servo moves).
+// =====================================================================
+void runDumpSweep() {
+  int stepMs = calcStepDelay(dumpDurationS);
+  unsigned long start = millis();
+
+  tprint("Continuous dump sweep START");
+
+  while (millis() - start < dumpDurationS * 1000UL) {
+
+    // 0 → 180
+    for (int a = 0; a <= 180; a++) {
+      s3.write(a);
+      delay(stepMs);
+
+      if (millis() - start >= dumpDurationS * 1000UL) break;
+    }
+
+    // 180 → 0
+    for (int a = 180; a >= 0; a--) {
+      s3.write(a);
+      delay(stepMs);
+
+      if (millis() - start >= dumpDurationS * 1000UL) break;
+    }
+  }
+
+  s3.write(0); // final closed position
+  tprint("Continuous dump sweep DONE");
 }
 
 // =====================================================================
@@ -343,37 +412,45 @@ void loop() {
     tprint("W:"+String(sd.weight_kg,2)+(sd.weight_ok?"":"[OFF]")+
            " NPK:"+String(sd.nitrogen)+"/"+String(sd.phosphorus)+"/"+String(sd.potassium)+
            " pH:"+String(sd.ph,2)+" T:"+String(sd.temp_c,1)+
-           " Reed:"+(reedOpen?"OPEN":"CLOSED")+
-           " "+stateStr(curState));
+           " Reed:"+(reedOpen?"OPEN":"CLOSED")+" "+stateStr(curState));
   }
   if(now-lastNPKT>=1000){ lastNPKT=now; readNPK_all(); }
 
   server.handleClient();
 
   // ── Manual servo override ─────────────────────────────────────────
+  // Only call .write() when the target angle has actually changed.
+  // Writing the same value every loop tick hammers the hardware timer
+  // and causes the occasional twitch/jitter seen in manual mode.
   if(manualServo){
-    s1.write(manSvAngle[0]); s2.write(manSvAngle[1]); s3.write(manSvAngle[2]);
+    if(manSvAngle[0]!=manSvWritten[0]){s1.write(manSvAngle[0]);manSvWritten[0]=manSvAngle[0];}
+    if(manSvAngle[1]!=manSvWritten[1]){s2.write(manSvAngle[1]);manSvWritten[1]=manSvAngle[1];}
+    if(manSvAngle[2]!=manSvWritten[2]){s3.write(manSvAngle[2]);manSvWritten[2]=manSvAngle[2];}
   }
 
-  // ── State machine — paused while manual servo mode is active ─────
+  // ── State machine ─────────────────────────────────────────────────
   if(!manualServo) switch(curState){
+
     case ST_WAIT:
       if(trig1||trig2){
         s1Target=trig1?0:180;
-        tprint(String("TRIGGER ")+(trig1?"1 (0°)":"2 (180°)")+" received"+(trig1Wireless||trig2Wireless?" [wireless]":" [hardware]"));
+        tprint(String("TRIGGER ")+(trig1?"1 (0°)":"2 (180°)")+
+               (trig1Wireless||trig2Wireless?" [wireless]":" [hardware]"));
         curState=ST_TRIG; lastDistT=now;
       }
       break;
 
     case ST_TRIG:
       if(!trig1&&!trig2){resetIdle();break;}
-      // Wireless triggers skip ultrasonic — object is already classified
       if(trig1Wireless||trig2Wireless){
-        tprint("Wireless trigger — skipping ultrasonic");
+        tprint("Wireless — skipping ultrasonic");
         curState=ST_DETECT; stateT=now; break;
       }
       if(now-lastDistT>=DISTANCE_READ_INTERVAL){
-        lastDistT=now; distCm=readUltrasonic();
+        lastDistT=now;
+        if     (ultraMode==ULTRA_OFF)   distCm=-1;
+        else if(ultraMode==ULTRA_RANGE) distCm=ultraRangeCm;
+        else                            distCm=readUltrasonic();
         if(distCm>=DETECTION_DISTANCE_MIN&&distCm<=DETECTION_DISTANCE_MAX){
           curState=ST_DETECT; stateT=now;
         }
@@ -384,29 +461,37 @@ void loop() {
 
     case ST_REED_CHECK:
       if(reedOpen){ tprint("ERROR: Reed open — aborting"); curState=ST_REED_ERR; stateT=now; }
-      else        { tprint("Reed closed — starting"); curState=ST_S1_SORT; stateT=now; }
+      else        { tprint("Reed closed — starting");      curState=ST_S1_SORT;  stateT=now; }
       break;
 
     case ST_REED_ERR: if(now-stateT>=5000) resetIdle(); break;
 
     case ST_S1_SORT:{
-      int a=90,step=(s1Target>90)?2:-2;
-      while(a!=s1Target){a+=step;if((step>0&&a>s1Target)||(step<0&&a<s1Target))a=s1Target;s1.write(a);delay(15);}
+      int a=90, step=(s1Target>90)?2:-2;
+      while(a!=s1Target){
+        a+=step;
+        if((step>0&&a>s1Target)||(step<0&&a<s1Target)) a=s1Target;
+        s1.write(a); delay(15);
+      }
       s1CurrentAngle=a;
       curState=ST_S1_CLOSE; stateT=now; break;
     }
 
     case ST_S1_CLOSE:
       if(now-stateT>=SERVO_1_CLOSE_DELAY){
-        int a=s1CurrentAngle,step=(a<90)?2:-2;
-        while(a!=90){a+=step;if((step>0&&a>90)||(step<0&&a<90))a=90;s1.write(a);delay(15);}
+        int a=s1CurrentAngle, step=(a<90)?2:-2;
+        while(a!=90){
+          a+=step;
+          if((step>0&&a>90)||(step<0&&a<90)) a=90;
+          s1.write(a); delay(15);
+        }
         s1CurrentAngle=90;
-        // Trigger 1 (pin 35) = paper: skip grinder + servo 2
+        // Trigger 1 = paper → skip grinder, go straight to dump
         if(trig1){
-          tprint("Trigger 1 (paper) — skipping grinder & servo 2, dumping");
+          tprint("Paper path — skipping grinder");
           curState=ST_S3_DUMP;
         } else {
-          tprint("Servo 1 closed — activating grinder");
+          tprint("Organic path — activating grinder");
           digitalWrite(SSR_RELAY_PIN,HIGH);
           curState=ST_SSR; stateT=now;
         }
@@ -414,28 +499,27 @@ void loop() {
       break;
 
     case ST_SSR:
-      if(now-stateT>=SSR_GRINDER_TIME){digitalWrite(SSR_RELAY_PIN,LOW);curState=ST_S2_OPEN;}
+      if(now-stateT>=SSR_GRINDER_TIME){
+        digitalWrite(SSR_RELAY_PIN,LOW);
+        curState=ST_S2_OPEN;
+      }
       break;
 
     case ST_S2_OPEN:{
-      int a=90; while(a<180){a+=2;s2.write(a);delay(15);}
+      for(int a=90;a<=180;a+=2){s2.write(a);delay(15);}
       delay(500); curState=ST_S2_CLOSE; break;
     }
 
     case ST_S2_CLOSE:{
-      int a=180; while(a>90){a-=2;s2.write(a);delay(15);}
+      for(int a=180;a>=90;a-=2){s2.write(a);delay(15);}
       curState=ST_S3_DUMP; break;
     }
 
+    // ── ST_S3_DUMP — back-and-forth sweep for dumpDurationS seconds ──
     case ST_S3_DUMP:{
-      // 5-cycle dump (matches v2 behaviour)
-      for(int cyc=0;cyc<5;cyc++){
-        tprint("Servo 3 dump cycle "+String(cyc+1)+"/5");
-        for(int a=180;a>=0;a-=2){s3.write(a);delay(SERVO_3_DELAY);}
-        s3.write(0); delay(200);
-        for(int a=0;a<=180;a+=2){s3.write(a);delay(SERVO_3_DELAY);}
-        s3.write(180);
-      }
+      tprint("Servo 3 dump — "+String(dumpDurationS)+" s");
+      runDumpSweep();
+      s3.write(0);   // return to closed / idle
       seqDone++;
       tprint("Sequence #"+String(seqDone)+" complete");
       curState=ST_COOL; stateT=now; break;
@@ -450,7 +534,13 @@ void loop() {
     if(c=='1'&&curState==ST_WAIT){s1Target=0;curState=ST_TRIG;}
     else if(c=='2'&&curState==ST_WAIT){s1Target=180;curState=ST_TRIG;}
     else if(c=='r'||c=='R'){digitalWrite(SSR_RELAY_PIN,LOW);resetIdle();}
-    else if(c=='s'||c=='S') tprint("State:"+stateStr(curState)+" AP:192.168.4.1 STA:"+WiFi.localIP().toString());
+    else if(c=='d'||c=='D'){
+      // Manual dump test from serial — useful for tuning duration
+      tprint("MANUAL DUMP TEST");
+      runDumpSweep(); s3.write(0);
+    }
+    else if(c=='s'||c=='S')
+      tprint("State:"+stateStr(curState)+" Dump:"+String(dumpDurationS)+"s AP:192.168.4.1");
   }
   delay(10);
 }
@@ -460,30 +550,39 @@ void loop() {
 // =====================================================================
 void startAP() {
   bool ok=WiFi.softAP(AP_SSID,AP_PASSWORD);
-  tprint(ok?"AP started: "+String(AP_SSID)+" @ 192.168.4.1":"AP FAILED");
+  tprint(ok?"AP: "+String(AP_SSID)+" @ 192.168.4.1":"AP FAILED");
 }
 
 void connectWiFi() {
   const char* ssids[]={WIFI_SSID_1,WIFI_SSID_2,WIFI_SSID_3,WIFI_SSID_4};
-  const char* pass[]={WIFI_PASSWORD_1,WIFI_PASSWORD_2,WIFI_PASSWORD_3,WIFI_PASSWORD_4};
+  const char* pass[] ={WIFI_PASSWORD_1,WIFI_PASSWORD_2,WIFI_PASSWORD_3,WIFI_PASSWORD_4};
   WiFi.config(STA_STATIC_IP,STA_GATEWAY,STA_SUBNET,STA_DNS);
   for(int n=0;n<4;n++){
     WiFi.begin(ssids[n],pass[n]);
     for(int i=0;i<10&&WiFi.status()!=WL_CONNECTED;i++) delay(500);
     if(WiFi.status()==WL_CONNECTED){
-      tprint("STA joined: "+String(ssids[n])+" @ "+WiFi.localIP().toString()); return;
+      tprint("STA: "+String(ssids[n])+" @ "+WiFi.localIP().toString()); return;
     }
   }
-  tprint("STA unavailable — AP-only mode (192.168.4.1)");
+  tprint("STA unavailable — AP-only (192.168.4.1)");
 }
 
 // =====================================================================
 // SENSOR HELPERS
 // =====================================================================
-int  readADC(int pin,int n){int r[10];for(int i=0;i<n;i++){r[i]=analogRead(pin);delay(2);}for(int i=0;i<n-1;i++)for(int j=i+1;j<n;j++)if(r[j]<r[i]){int t=r[i];r[i]=r[j];r[j]=t;}return r[n/2];}
+int  readADC(int pin,int n){
+  int r[10];
+  for(int i=0;i<n;i++){r[i]=analogRead(pin);delay(2);}
+  for(int i=0;i<n-1;i++) for(int j=i+1;j<n;j++) if(r[j]<r[i]){int t=r[i];r[i]=r[j];r[j]=t;}
+  return r[n/2];
+}
 bool isActive(int v){return v>ANALOG_MIN_THRESHOLD;}
-bool isMQ(int v){return v>MQ_MIN_THRESHOLD;}
-bool safeTare(unsigned long ms){unsigned long t=millis();while(!scale.is_ready()){if(millis()-t>ms)return false;delay(10);}scale.tare();return true;}
+bool isMQ(int v)    {return v>MQ_MIN_THRESHOLD;}
+bool safeTare(unsigned long ms){
+  unsigned long t=millis();
+  while(!scale.is_ready()){if(millis()-t>ms)return false;delay(10);}
+  scale.tare(); return true;
+}
 
 // =====================================================================
 // SENSOR READING
@@ -517,12 +616,18 @@ void readSensors() {
 
   if     (ov.weight==OVERRIDE_OFF)   {sd.weight_ok=false;sd.weight_kg=0;}
   else if(ov.weight==OVERRIDE_RANGE) {sd.weight_ok=true; sd.weight_kg=rv.weight_kg;}
-  else{if(scale.is_ready()){float w=scale.get_units(5)/1000.0f;sd.weight_kg=w<0?0:w;sd.weight_ok=true;}else{sd.weight_kg=0;sd.weight_ok=false;}}
+  else{
+    if(scale.is_ready()){float w=scale.get_units(5)/1000.0f;sd.weight_kg=w<0?0:w;sd.weight_ok=true;}
+    else{sd.weight_kg=0;sd.weight_ok=false;}
+  }
 
   if     (ov.reed==OVERRIDE_OFF)   {sd.reed_ok=false;sd.reed_state=false;}
   else if(ov.reed==OVERRIDE_CYCLE) {sd.reed_ok=true; sd.reed_state=((cycleCounter/5)%2==0);}
   else if(ov.reed==OVERRIDE_RANGE) {sd.reed_ok=true; sd.reed_state=rv.reed_closed;}
-  else{sd.reed_state=!reedOpen;sd.reed_ok=true;}
+  else{
+    sd.reed_state = !reedOpen;
+    sd.reed_ok    = (ov.reed != OVERRIDE_OFF);
+  }
 
   if     (ov.dht==OVERRIDE_OFF)   {sd.dht_ok=false;sd.temp_c=0;sd.humidity=0;}
   else if(ov.dht==OVERRIDE_CYCLE) {sd.dht_ok=true; sd.temp_c=fakeCycleFloat(22,35,4);sd.humidity=fakeCycleFloat(40,90,8);}
@@ -540,10 +645,12 @@ void readSensors() {
 }
 
 void readNPK_all() {
-  if     (ov.npk==OVERRIDE_OFF)   {sd.npk_ok=false;sd.nitrogen=sd.phosphorus=sd.potassium=0;return;}
-  if     (ov.npk==OVERRIDE_CYCLE) {sd.npk_ok=true;sd.nitrogen=fakeCycleInt(10,120,0);sd.phosphorus=fakeCycleInt(5,80,5);sd.potassium=fakeCycleInt(8,100,10);return;}
-  if     (ov.npk==OVERRIDE_RANGE) {sd.npk_ok=true;sd.nitrogen=rv.nitrogen;sd.phosphorus=rv.phosphorus;sd.potassium=rv.potassium;return;}
-  int n=readNPKcmd(npkN);delay(50);int p=readNPKcmd(npkP);delay(50);int k=readNPKcmd(npkK);
+  if(ov.npk==OVERRIDE_OFF)  {sd.npk_ok=false;sd.nitrogen=sd.phosphorus=sd.potassium=0;return;}
+  if(ov.npk==OVERRIDE_CYCLE){sd.npk_ok=true;sd.nitrogen=fakeCycleInt(10,120,0);sd.phosphorus=fakeCycleInt(5,80,5);sd.potassium=fakeCycleInt(8,100,10);return;}
+  if(ov.npk==OVERRIDE_RANGE){sd.npk_ok=true;sd.nitrogen=rv.nitrogen;sd.phosphorus=rv.phosphorus;sd.potassium=rv.potassium;return;}
+  int n=readNPKcmd(npkN);delay(50);
+  int p=readNPKcmd(npkP);delay(50);
+  int k=readNPKcmd(npkK);
   npkStreak=sd.npk_ok?npkStreak+1:0;
   bool ok=(npkStreak>=NPK_CONFIRM_READS);
   sd.nitrogen=ok?n:0;sd.phosphorus=ok?p:0;sd.potassium=ok?k:0;sd.npk_ok=ok;
@@ -567,8 +674,20 @@ float readPH(){
 // =====================================================================
 // SERVO / MECHANICAL HELPERS
 // =====================================================================
-void setupServos(){s1.attach(SERVO_1_PIN,SERVO_MIN_PULSE,SERVO_MAX_PULSE);s2.attach(SERVO_2_PIN,SERVO_MIN_PULSE,SERVO_MAX_PULSE);s3.attach(SERVO_3_PIN,SERVO_MIN_PULSE,SERVO_MAX_PULSE);}
-void readReed()    {reedOpen=digitalRead(REED_SWITCH_PIN);}
+
+void setupServos(){
+  s1.attach(SERVO_1_PIN,SERVO_MIN_PULSE,SERVO_MAX_PULSE);
+  s2.attach(SERVO_2_PIN,SERVO_MIN_PULSE,SERVO_MAX_PULSE);
+  s3.attach(SERVO_3_PIN,SERVO_MIN_PULSE,SERVO_MAX_PULSE);
+}
+void readReed() {
+  bool hwOpen = digitalRead(REED_SWITCH_PIN);  // HIGH = open (INPUT_PULLUP)
+
+  if      (ov.reed == OVERRIDE_OFF)   { reedOpen = true;              }  // treat as always open
+  else if (ov.reed == OVERRIDE_RANGE) { reedOpen = !rv.reed_closed;   }  // CLOSED toggle → not open
+  else if (ov.reed == OVERRIDE_CYCLE) { reedOpen = !((cycleCounter/5)%2==0); }
+  else                                { reedOpen = hwOpen;             }  // LIVE
+}
 void readTriggers(){
   bool hw1=digitalRead(TRIGGER_1_PIN), hw2=digitalRead(TRIGGER_2_PIN);
   trig1=hw1||trig1Wireless;
@@ -579,40 +698,47 @@ float readUltrasonic(){
   digitalWrite(ULTRASONIC_TRIG,HIGH);delayMicroseconds(10);
   digitalWrite(ULTRASONIC_TRIG,LOW);
   long d=pulseIn(ULTRASONIC_ECHO,HIGH,ULTRASONIC_TIMEOUT);
-  if(d<=0)return -1;float cm=d/29.1f/2.0f;return(cm>MAX_DISTANCE)?-1:cm;
+  if(d<=0)return -1;
+  float cm=d/29.1f/2.0f;
+  return(cm>MAX_DISTANCE)?-1:cm;
 }
 void resetIdle(){
-  s1.write(90);s1CurrentAngle=90;s2.write(90);s3.write(180);
+  s1.write(90);s1CurrentAngle=90;
+  s2.write(90);
+  s3.write(0);   // closed position
   digitalWrite(SSR_RELAY_PIN,LOW);
   trig1=false;trig2=false;
   trig1Wireless=false;trig2Wireless=false;
-  s1Target=0;
-  curState=ST_WAIT; tprint("Reset — waiting for trigger");
+  s1Target=0; curState=ST_WAIT;
+  tprint("Reset — waiting for trigger");
 }
 String stateStr(SystemState s){
   switch(s){
-    case ST_WAIT:     return "waiting";
-    case ST_TRIG:     return "trigger_active";
-    case ST_DETECT:   return "object_detected";
+    case ST_WAIT:      return "waiting";
+    case ST_TRIG:      return "trigger_active";
+    case ST_DETECT:    return "object_detected";
     case ST_REED_CHECK:return "reed_check";
-    case ST_REED_ERR: return "reed_error";
-    case ST_S1_SORT:  return "s1_sorting";
-    case ST_S1_CLOSE: return "s1_closing";
-    case ST_SSR:      return "grinding";
-    case ST_S2_OPEN:  return "s2_opening";
-    case ST_S2_CLOSE: return "s2_closing";
-    case ST_S3_DUMP:  return "s3_dumping";
-    case ST_COOL:     return "cooldown";
-    default:          return "unknown";
+    case ST_REED_ERR:  return "reed_error";
+    case ST_S1_SORT:   return "s1_sorting";
+    case ST_S1_CLOSE:  return "s1_closing";
+    case ST_SSR:       return "grinding";
+    case ST_S2_OPEN:   return "s2_opening";
+    case ST_S2_CLOSE:  return "s2_closing";
+    case ST_S3_DUMP:   return "s3_dumping";
+    case ST_COOL:      return "cooldown";
+    default:           return "unknown";
   }
 }
 
 // =====================================================================
 // OVERRIDE HELPERS
 // =====================================================================
-String ovStr(SensorOverride o){switch(o){case OVERRIDE_OFF:return"off";case OVERRIDE_CYCLE:return"cycle";case OVERRIDE_RANGE:return"range";default:return"live";}}
-SensorOverride strToOv(const String& s){if(s=="off")return OVERRIDE_OFF;if(s=="cycle")return OVERRIDE_CYCLE;if(s=="range")return OVERRIDE_RANGE;return OVERRIDE_LIVE;}
-
+String ovStr(SensorOverride o){
+  switch(o){case OVERRIDE_OFF:return"off";case OVERRIDE_CYCLE:return"cycle";case OVERRIDE_RANGE:return"range";default:return"live";}
+}
+SensorOverride strToOv(const String& s){
+  if(s=="off")return OVERRIDE_OFF;if(s=="cycle")return OVERRIDE_CYCLE;if(s=="range")return OVERRIDE_RANGE;return OVERRIDE_LIVE;
+}
 String badge(SensorOverride o){
   switch(o){
     case OVERRIDE_OFF:   return "<span class='b boff'>OFF</span>";
@@ -668,8 +794,7 @@ String sharedCSS() {
                    "border-radius:3px;cursor:pointer;font-family:inherit;font-size:12px}"
     "button.danger:hover{background:#3a1010}"
     "code{background:#0c1820;padding:1px 5px;border-radius:2px;color:#3498db}"
-    ".vc{color:#ecf0f1}"
-    ".rc{min-width:330px}"
+    ".vc{color:#ecf0f1} .rc{min-width:330px}"
     "</style>";
 }
 
@@ -687,34 +812,34 @@ void handleRoot(){
     "<meta http-equiv='refresh' content='5'><title>NutriBin</title>"+sharedCSS()+"</head><body>"
     "<h1>&#9654; NutriBin Node</h1>";
   h+="<div class='ipb'>"
-     "AP (always-on) &nbsp; WiFi: <b>"+String(AP_SSID)+"</b> &nbsp;→&nbsp; <code>http://192.168.4.1</code><br>"
-     "STA (optional) &nbsp; <code>http://"+WiFi.localIP().toString()+"</code> &nbsp; "+
+     "AP: <b>"+String(AP_SSID)+"</b> → <code>http://192.168.4.1</code><br>"
+     "STA: <code>http://"+WiFi.localIP().toString()+"</code> "+
      (WiFi.status()==WL_CONNECTED?"<span class='sok'>Connected</span>":"<span class='serr'>Not joined</span>")+
      "</div>";
-  h+="<p>State: <b>"+stateStr(curState)+"</b> &nbsp;|&nbsp; Sequences: "+String(seqDone)+
-     " &nbsp;|&nbsp; Reed: "+(reedOpen?"<span class='serr'>OPEN</span>":"<span class='sok'>CLOSED</span>")+
-     " &nbsp;|&nbsp; Fan: <span class='sok'>always on</span></p>";
-  if(lastClassification.length()>0){
+  h+="<p>State: <b>"+stateStr(curState)+"</b> | Sequences: "+String(seqDone)+
+     " | Reed: "+(reedOpen?"<span class='serr'>OPEN</span>":"<span class='sok'>CLOSED</span>")+
+     " | Fan: <span class='sok'>always on</span>"
+     " | Dump: <b>"+String(dumpDurationS)+" s</b></p>";
+  if(lastClassification.length()>0)
     h+="<p>Last classification: <b>"+lastClassification+"</b>"
        " (prob: "+String(lastClassProb,2)+", trigger: "+String(lastClassTrigger)+")</p>";
-  }
   h+="<a class='btn' href='/debug'>Debug Panel</a>"
      "<a class='btn' href='/terminal'>Terminal</a>"
      "<a class='btn' href='/data'>JSON /data</a>";
   h+="<h2>Sensors</h2><table><tr><th>Sensor</th><th>Value</th><th>Status</th></tr>";
-  h+=sensorRow("Weight",          String(sd.weight_kg,3)+" kg",       sd.weight_ok);
-  h+=sensorRow("Nitrogen",        String(sd.nitrogen)+" mg/kg",        sd.npk_ok);
-  h+=sensorRow("Phosphorus",      String(sd.phosphorus)+" mg/kg",      sd.npk_ok);
-  h+=sensorRow("Potassium",       String(sd.potassium)+" mg/kg",       sd.npk_ok);
-  h+=sensorRow("Temperature",     String(sd.temp_c,1)+" °C",           sd.dht_ok);
-  h+=sensorRow("Humidity",        String(sd.humidity,1)+" %",          sd.dht_ok);
-  h+=sensorRow("Soil moisture",   String(sd.soil),                     sd.soil_ok);
-  h+=sensorRow("pH",              String(sd.ph,2),                     sd.ph_ok);
-  h+=sensorRow("MQ135 (air)",     String(sd.mq135),                    sd.mq135_ok);
-  h+=sensorRow("MQ2 (combustible)",String(sd.mq2),                     sd.mq2_ok);
-  h+=sensorRow("MQ4 (methane)",   String(sd.mq4),                      sd.mq4_ok);
-  h+=sensorRow("MQ7 (CO)",        String(sd.mq7),                      sd.mq7_ok);
-  h+=sensorRow("Reed switch",     sd.reed_state?"CLOSED":"OPEN",       sd.reed_ok);
+  h+=sensorRow("Weight",           String(sd.weight_kg,3)+" kg",     sd.weight_ok);
+  h+=sensorRow("Nitrogen",         String(sd.nitrogen)+" mg/kg",      sd.npk_ok);
+  h+=sensorRow("Phosphorus",       String(sd.phosphorus)+" mg/kg",    sd.npk_ok);
+  h+=sensorRow("Potassium",        String(sd.potassium)+" mg/kg",     sd.npk_ok);
+  h+=sensorRow("Temperature",      String(sd.temp_c,1)+" °C",         sd.dht_ok);
+  h+=sensorRow("Humidity",         String(sd.humidity,1)+" %",        sd.dht_ok);
+  h+=sensorRow("Soil moisture",    String(sd.soil),                   sd.soil_ok);
+  h+=sensorRow("pH",               String(sd.ph,2),                   sd.ph_ok);
+  h+=sensorRow("MQ135 (air)",      String(sd.mq135),                  sd.mq135_ok);
+  h+=sensorRow("MQ2 (combustible)",String(sd.mq2),                    sd.mq2_ok);
+  h+=sensorRow("MQ4 (methane)",    String(sd.mq4),                    sd.mq4_ok);
+  h+=sensorRow("MQ7 (CO)",         String(sd.mq7),                    sd.mq7_ok);
+  h+=sensorRow("Reed switch",      sd.reed_state?"CLOSED":"OPEN",     sd.reed_ok);
   h+="</table></body></html>";
   server.send(200,"text/html",h);
 }
@@ -725,10 +850,10 @@ void handleRoot(){
 String debugRow(const String& key, const String& lbl,
                 const String& lv, bool lok, SensorOverride mode) {
   String sc=lok?"#2ecc71":"#e74c3c";
-  String lc=(mode==OVERRIDE_LIVE)  ?" checked":"";
-  String oc=(mode==OVERRIDE_OFF)   ?" checked":"";
-  String cc=(mode==OVERRIDE_CYCLE) ?" checked":"";
-  String rc=(mode==OVERRIDE_RANGE) ?" checked":"";
+  String lc=(mode==OVERRIDE_LIVE) ?" checked":"";
+  String oc=(mode==OVERRIDE_OFF)  ?" checked":"";
+  String cc=(mode==OVERRIDE_CYCLE)?" checked":"";
+  String rc=(mode==OVERRIDE_RANGE)?" checked":"";
 
   String radios=
     "<label><input type='radio' name='"+key+"' value='live'"+lc+" onchange='chMode(this)'> Live</label>"
@@ -750,20 +875,17 @@ String debugRow(const String& key, const String& lbl,
     rw="<div class='rw' id='rw_weight' style='"+disp+"'>"
        "<input type='range' min='0' max='20' step='0.05' value='"+String(rv.weight_kg,2)+"'"
        " oninput='sv(this,\"rv\",\"kg\",2)' onchange='post(\"weight_kg\",this.value)'>"
-       "<span class='rv' id='rv_weight'>"+String(rv.weight_kg,2)+" kg</span>"
-       "</div>";
+       "<span class='rv' id='rv_weight'>"+String(rv.weight_kg,2)+" kg</span></div>";
   } else if(key=="soil"){
     rw="<div class='rw' id='rw_soil' style='"+disp+"'>"
        "<input type='range' min='0' max='4095' step='10' value='"+String(rv.soil)+"'"
        " oninput='sv(this,\"rv\",\"\",0)' onchange='post(\"soil_val\",this.value)'>"
-       "<span class='rv' id='rv_soil'>"+String(rv.soil)+"</span>"
-       "</div>";
+       "<span class='rv' id='rv_soil'>"+String(rv.soil)+"</span></div>";
   } else if(key=="ph"){
     rw="<div class='rw' id='rw_ph' style='"+disp+"'>"
        "<input type='range' min='0' max='14' step='0.1' value='"+String(rv.ph,1)+"'"
        " oninput='sv(this,\"rv\",\"\",1)' onchange='post(\"ph_val\",this.value)'>"
-       "<span class='rv' id='rv_ph'>"+String(rv.ph,1)+"</span>"
-       "</div>";
+       "<span class='rv' id='rv_ph'>"+String(rv.ph,1)+"</span></div>";
   } else if(key=="dht"){
     rw="<div class='rw' id='rw_dht' style='"+disp+"'>"
        "T&nbsp;<input type='range' min='-10' max='60' step='0.5' value='"+String(rv.temp_c,1)+"'"
@@ -771,8 +893,7 @@ String debugRow(const String& key, const String& lbl,
        "<span class='rv' id='rvt_dht'>"+String(rv.temp_c,1)+" °C</span>"
        "&nbsp; H&nbsp;<input type='range' min='0' max='100' step='1' value='"+String(rv.humidity,0)+"'"
        " oninput='sv(this,\"rvh\",\"%\",0)' onchange='post(\"hum_val\",this.value)'>"
-       "<span class='rv' id='rvh_dht'>"+String(rv.humidity,0)+" %</span>"
-       "</div>";
+       "<span class='rv' id='rvh_dht'>"+String(rv.humidity,0)+" %</span></div>";
   } else if(key=="npk"){
     rw="<div class='rw' id='rw_npk' style='"+disp+"'>"
        "N&nbsp;<input type='range' min='0' max='200' step='1' value='"+String(rv.nitrogen)+"'"
@@ -784,133 +905,170 @@ String debugRow(const String& key, const String& lbl,
        "&nbsp; K&nbsp;<input type='range' min='0' max='200' step='1' value='"+String(rv.potassium)+"'"
        " oninput='sv(this,\"rvk\",\"\",0)' onchange='post(\"npk_k\",this.value)'>"
        "<span class='rv' id='rvk_npk'>"+String(rv.potassium)+"</span>"
-       " <span style='color:#5a7a8a;font-size:11px'>mg/kg</span>"
-       "</div>";
+       " <span style='color:#5a7a8a;font-size:11px'>mg/kg</span></div>";
   } else {
     int cur=(key=="mq135")?rv.mq135:(key=="mq2")?rv.mq2:(key=="mq4")?rv.mq4:rv.mq7;
     String vkey=key+"_val";
     rw="<div class='rw' id='rw_"+key+"' style='"+disp+"'>"
        "<input type='range' min='0' max='4095' step='5' value='"+String(cur)+"'"
        " oninput='sv(this,\"rv\",\"\",0)' onchange='post(\""+vkey+"\",this.value)'>"
-       "<span class='rv' id='rv_"+key+"'>"+String(cur)+"</span>"
-       "</div>";
+       "<span class='rv' id='rv_"+key+"'>"+String(cur)+"</span></div>";
   }
 
-  return
-    "<tr>"
-    "<td><b>"+lbl+"</b></td>"
-    "<td class='vc'>"+lv+"</td>"
-    "<td style='color:"+sc+";font-weight:bold'>"+(lok?"OK":"OFFLINE")+"</td>"
-    "<td>"+badge(mode)+"</td>"
-    "<td class='rc'>"+radios+rw+"</td>"
-    "</tr>";
+  return "<tr><td><b>"+lbl+"</b></td><td class='vc'>"+lv+"</td>"
+         "<td style='color:"+sc+";font-weight:bold'>"+(lok?"OK":"OFFLINE")+"</td>"
+         "<td>"+badge(mode)+"</td><td class='rc'>"+radios+rw+"</td></tr>";
 }
 
 void handleDebug(){
   String h="<!DOCTYPE html><html><head><meta charset='UTF-8'>"
     "<title>NutriBin Debug</title>"+sharedCSS()+
     "<script>"
-    "function chMode(el){"
-    "  var fd=new FormData();fd.append(el.name,el.value);"
-    "  fetch('/debug/set',{method:'POST',body:fd}).then(()=>location.reload());"
-    "}"
-    "function sv(el,pre,unit,dec){"
-    "  var sp=el.nextElementSibling;"
-    "  if(sp)sp.textContent=parseFloat(el.value).toFixed(dec)+(unit?' '+unit:'');"
-    "}"
-    "function post(k,v){"
-    "  var fd=new FormData();fd.append(k,v);"
-    "  fetch('/debug/set',{method:'POST',body:fd});"
-    "}"
-    "function toggleManual(on){"
-    "  var fd=new FormData();fd.append('manual_servo',on?'1':'0');"
-    "  fetch('/servo/set',{method:'POST',body:fd}).then(()=>location.reload());"
-    "}"
-    "function setSv(idx,ang){"
-    "  var fd=new FormData();fd.append('sv'+idx,ang);"
-    "  fetch('/servo/set',{method:'POST',body:fd});"
-    "}"
-    "function setReed(closed){"
-    "  var btns=document.querySelectorAll('#rw_reed button');"
-    "  btns[0].className=closed?'ta':'';btns[1].className=closed?'':'tb';"
-    "  post('reed_bool',closed?'1':'0');"
-    "}"
-    "</script>"
-    "</head><body>"
+    "function chMode(el){var fd=new FormData();fd.append(el.name,el.value);"
+    "fetch('/debug/set',{method:'POST',body:fd}).then(()=>location.reload());}"
+    "function sv(el,pre,unit,dec){var sp=el.nextElementSibling;"
+    "if(sp)sp.textContent=parseFloat(el.value).toFixed(dec)+(unit?' '+unit:'');}"
+    "function post(k,v){var fd=new FormData();fd.append(k,v);"
+    "fetch('/debug/set',{method:'POST',body:fd});}"
+    "function toggleManual(on){var fd=new FormData();fd.append('manual_servo',on?'1':'0');"
+    "fetch('/servo/set',{method:'POST',body:fd}).then(()=>location.reload());}"
+    "function setSv(idx,ang){var fd=new FormData();fd.append('sv'+idx,ang);"
+    "fetch('/servo/set',{method:'POST',body:fd});}"
+    "function setReed(closed){var btns=document.querySelectorAll('#rw_reed button');"
+    "btns[0].className=closed?'ta':'';btns[1].className=closed?'':'tb';"
+    "post('reed_bool',closed?'1':'0');}"
+    "function setDump(v){document.getElementById('dump_lbl').textContent=v+' s';"
+    "var fd=new FormData();fd.append('dump_duration',v);"
+    "fetch('/debug/set',{method:'POST',body:fd});}"
+    "function setUltra(mode){"
+    "  var fd=new FormData();fd.append('ultra_mode',mode);"
+    "  fetch('/debug/set',{method:'POST',body:fd}).then(()=>location.reload());}"
+    "function setUltraCm(v){"
+    "  document.getElementById('ultra_lbl').textContent=v+' cm';"
+    "  var fd=new FormData();fd.append('ultra_cm',v);"
+    "  fetch('/debug/set',{method:'POST',body:fd});}"
+    "</script></head><body>"
     "<h1>&#9654; Debug Panel</h1>";
 
-  h+="<div class='ipb'>"
-     "AP: <code>http://192.168.4.1/debug</code> &nbsp;|&nbsp; "
-     "STA: <code>http://"+WiFi.localIP().toString()+"/debug</code>"
-     "</div>";
+  h+="<div class='ipb'>AP: <code>http://192.168.4.1/debug</code> &nbsp;|&nbsp; "
+     "STA: <code>http://"+WiFi.localIP().toString()+"/debug</code></div>";
 
   h+="<div class='note'>"
-     "<b style='color:#2ecc71'>LIVE</b> — real hardware &nbsp;|&nbsp; "
-     "<b style='color:#e74c3c'>OFF</b> — sensor offline, zeros in JSON &nbsp;|&nbsp; "
-     "<b style='color:#f39c12'>CYCLE</b> — oscillating fake data &nbsp;|&nbsp; "
-     "<b style='color:#3498db'>RANGE</b> — slider/toggle sets the value sent in JSON"
-     "</div>";
+     "<b style='color:#2ecc71'>LIVE</b> real hardware &nbsp;|&nbsp; "
+     "<b style='color:#e74c3c'>OFF</b> offline/zeros &nbsp;|&nbsp; "
+     "<b style='color:#f39c12'>CYCLE</b> oscillating fake &nbsp;|&nbsp; "
+     "<b style='color:#3498db'>RANGE</b> slider value</div>";
 
   h+="<table><tr><th>Sensor</th><th>Live value</th><th>HW</th><th>Mode</th><th>Override controls</th></tr>";
   h+=debugRow("npk","NPK (N/P/K)",
-    String(sd.nitrogen)+"/"+String(sd.phosphorus)+"/"+String(sd.potassium)+" mg/kg",
-    sd.npk_ok,ov.npk);
-  h+=debugRow("weight","Weight",String(sd.weight_kg,3)+" kg",         sd.weight_ok, ov.weight);
+    String(sd.nitrogen)+"/"+String(sd.phosphorus)+"/"+String(sd.potassium)+" mg/kg",sd.npk_ok,ov.npk);
+  h+=debugRow("weight","Weight",        String(sd.weight_kg,3)+" kg",             sd.weight_ok,ov.weight);
   h+=debugRow("dht","Temp / Humidity",
-    String(sd.temp_c,1)+" °C / "+String(sd.humidity,1)+" %",          sd.dht_ok,    ov.dht);
-  h+=debugRow("ph","pH",          String(sd.ph,2),                    sd.ph_ok,     ov.ph);
-  h+=debugRow("soil","Soil moisture",String(sd.soil),                 sd.soil_ok,   ov.soil);
-  h+=debugRow("mq135","MQ135 (air quality)",String(sd.mq135),         sd.mq135_ok,  ov.mq135);
-  h+=debugRow("mq2","MQ2 (combustible)",String(sd.mq2),               sd.mq2_ok,    ov.mq2);
-  h+=debugRow("mq4","MQ4 (methane)",String(sd.mq4),                   sd.mq4_ok,    ov.mq4);
-  h+=debugRow("mq7","MQ7 (CO)",String(sd.mq7),                        sd.mq7_ok,    ov.mq7);
-  h+=debugRow("reed","Reed switch",sd.reed_state?"CLOSED":"OPEN",     sd.reed_ok,   ov.reed);
+    String(sd.temp_c,1)+" °C / "+String(sd.humidity,1)+" %",                      sd.dht_ok,  ov.dht);
+  h+=debugRow("ph","pH",                String(sd.ph,2),                           sd.ph_ok,   ov.ph);
+  h+=debugRow("soil","Soil moisture",   String(sd.soil),                           sd.soil_ok, ov.soil);
+  h+=debugRow("mq135","MQ135 (air)",    String(sd.mq135),                          sd.mq135_ok,ov.mq135);
+  h+=debugRow("mq2","MQ2 (combustible)",String(sd.mq2),                            sd.mq2_ok, ov.mq2);
+  h+=debugRow("mq4","MQ4 (methane)",    String(sd.mq4),                            sd.mq4_ok, ov.mq4);
+  h+=debugRow("mq7","MQ7 (CO)",         String(sd.mq7),                            sd.mq7_ok, ov.mq7);
+  h+=debugRow("reed","Reed switch",     sd.reed_state?"CLOSED":"OPEN",             sd.reed_ok,ov.reed);
   h+="</table>";
 
-  // ── Manual Servo Control ──────────────────────────────────────────
-  String manChk = manualServo?" checked":"";
-  h+="<h2>Manual Servo Control</h2>";
+  // ── Ultrasonic override ───────────────────────────────────────────
+  // Lets you test the state machine without a physical object in range.
+  String uLive  =(ultraMode==ULTRA_LIVE) ?" checked":"";
+  String uOff   =(ultraMode==ULTRA_OFF)  ?" checked":"";
+  String uRange =(ultraMode==ULTRA_RANGE)?" checked":"";
+  String uRangeDisp=(ultraMode==ULTRA_RANGE)?"":"display:none";
+  // badge for current mode
+  String uBadge;
+  if     (ultraMode==ULTRA_OFF)   uBadge="<span class='b boff'>OFF</span>";
+  else if(ultraMode==ULTRA_RANGE) uBadge="<span class='b brng'>RANGE</span>";
+  else                            uBadge="<span class='b bliv'>LIVE</span>";
+
+  h+="<h2>Ultrasonic Sensor</h2>";
   h+="<div class='note'>"
-     "Enable manual mode to directly position each servo. "
-     "<b style='color:#e74c3c'>The sorting state machine pauses while this is active.</b>"
+     "Live distance: <b style='color:#ecf0f1'>"+String(distCm,1)+" cm</b> &nbsp;|&nbsp; "
+     "In-range: <b>"+(distCm>=DETECTION_DISTANCE_MIN&&distCm<=DETECTION_DISTANCE_MAX
+       ?"<span class='sok'>YES</span>":"<span class='serr'>NO</span>")+"</b>"
+     " &nbsp;|&nbsp; Mode: "+uBadge+"<br>"
+     "Trigger window: "+String(DETECTION_DISTANCE_MIN)+" – "+String(DETECTION_DISTANCE_MAX)+" cm"
      "</div>";
+  h+="<div style='background:#0c1820;border:1px solid #1a2a36;border-radius:3px;padding:14px;max-width:1060px'>";
+  // Mode radios
+  h+="<div style='margin-bottom:10px'>"
+     "<label><input type='radio' name='ultra_mode' value='live'"+uLive+
+     " onchange='setUltra(this.value)'> Live (real HC-SR04)</label>"
+     "<label><input type='radio' name='ultra_mode' value='off'"+uOff+
+     " onchange='setUltra(this.value)'> Off (always no object)</label>"
+     "<label><input type='radio' name='ultra_mode' value='range'"+uRange+
+     " onchange='setUltra(this.value)'> Range (fake fixed cm)</label>"
+     "</div>";
+  // Fake cm slider — shown only in RANGE mode
+  h+="<div class='rw' id='ultra_rw' style='"+uRangeDisp+"'>"
+     "<input type='range' min='1' max='40' step='0.5' value='"+String(ultraRangeCm,1)+"'"
+     " oninput='setUltraCm(this.value)'>"
+     "<span class='rv' id='ultra_lbl'>"+String(ultraRangeCm,1)+" cm</span>"
+     "<span style='font-size:11px;color:#5a7a8a'>"
+     "in-range: "+String(DETECTION_DISTANCE_MIN)+"–"+String(DETECTION_DISTANCE_MAX)+" cm"
+     "</span>"
+     "</div>";
+  h+="</div>";
+
+  // ── Dump duration control ─────────────────────────────────────────
+  h+="<h2>Dump Duration (Servo 3)</h2>";
+  h+="<div class='note'>Sets how long servo 3 spends sweeping 0°→180°→0°. "
+     "Step delay auto-scales to fill the time. "
+     "Current: <b style='color:#3498db'>"+String(dumpDurationS)+" s</b> "
+     "→ <b style='color:#3498db'>"+String(calcStepDelay(dumpDurationS))+" ms/step</b></div>";
+  h+="<div style='background:#0c1820;border:1px solid #1a2a36;border-radius:3px;padding:14px;max-width:1060px'>"
+     "<div class='rw'>"
+     "<input type='range' min='1' max='300' step='1' value='"+String(dumpDurationS)+"'"
+     " oninput='setDump(this.value)'>"
+     "<span class='rv' id='dump_lbl'>"+String(dumpDurationS)+" s</span>"
+     "</div>"
+     "<p style='font-size:11px;color:#5a7a8a;margin-top:8px'>"
+     "1 s → "+String(calcStepDelay(1))+" ms/step &nbsp;|&nbsp; "
+     "60 s → "+String(calcStepDelay(60))+" ms/step &nbsp;|&nbsp; "
+     "300 s → "+String(calcStepDelay(300))+" ms/step (very slow)"
+     "</p></div>";
+
+  // ── Manual Servo Control ──────────────────────────────────────────
+  String manChk=manualServo?" checked":"";
+  h+="<h2>Manual Servo Control</h2>";
+  h+="<div class='note'>Pauses the state machine. "
+     "<b style='color:#e74c3c'>Disable to resume normal operation.</b></div>";
   h+="<div style='background:#0c1820;border:1px solid #1a2a36;border-radius:3px;padding:14px;max-width:1060px'>";
   h+="<div style='margin-bottom:12px;display:flex;align-items:center;gap:12px'>"
      "<label style='font-size:13px;color:#ecf0f1'><input type='checkbox'"+manChk+
      " onchange='toggleManual(this.checked)'> &nbsp; Enable manual servo mode</label>"
      "<span style='font-size:11px;color:"+String(manualServo?"#e74c3c":"#3d6b50")+"'>"
-     +(manualServo?"&#9888; STATE MACHINE PAUSED":"&#10003; State machine running")+
-     "</span></div>";
+     +(manualServo?"&#9888; STATE MACHINE PAUSED":"&#10003; State machine running")+"</span></div>";
   const char* svNames[]={"Servo 1 (Sorting gate — 0° / 90° / 180°)",
                           "Servo 2 (Drop gate — 90°=closed 180°=open)",
-                          "Servo 3 (Dump chute — 0°=dump 180°=hold)"};
+                          "Servo 3 (Dump chute — 0°=closed 180°=open)"};
   for(int i=0;i<3;i++){
-    int cur=manSvAngle[i];
     String dis=manualServo?"":"opacity:0.35;pointer-events:none";
-    h+="<div style='margin-bottom:10px;"+dis+"'>";
-    h+="<span style='font-size:12px;color:#7a9aaa'>"+String(svNames[i])+"</span><br>";
-    h+="<div class='rw' style='margin-top:4px'>"
-       "<input type='range' min='0' max='180' step='1' value='"+String(cur)+"'"
+    h+="<div style='margin-bottom:10px;"+dis+"'>"
+       "<span style='font-size:12px;color:#7a9aaa'>"+String(svNames[i])+"</span><br>"
+       "<div class='rw' style='margin-top:4px'>"
+       "<input type='range' min='0' max='180' step='1' value='"+String(manSvAngle[i])+"'"
        " oninput='this.nextElementSibling.textContent=this.value+\"°\"'"
        " onchange='setSv("+String(i)+",this.value)'>"
-       "<span class='rv'>"+String(cur)+"°</span>"
+       "<span class='rv'>"+String(manSvAngle[i])+"°</span>"
        "</div></div>";
   }
   h+="</div>";
 
-  // ── Classify status ───────────────────────────────────────────────
-  h+="<h2>Last Classification</h2>";
-  h+="<div class='ipb'>";
-  if(lastClassification.length()>0){
-    h+="Label: <b>"+lastClassification+"</b> &nbsp; "
-       "Probability: <b>"+String(lastClassProb,2)+"</b> &nbsp; "
-       "Trigger: <b>"+String(lastClassTrigger)+"</b><br>"
+  // ── Last classification ───────────────────────────────────────────
+  h+="<h2>Last Classification</h2><div class='ipb'>";
+  if(lastClassification.length()>0)
+    h+="Label: <b>"+lastClassification+"</b> &nbsp; Prob: <b>"+String(lastClassProb,2)+"</b>"
+       " &nbsp; Trigger: <b>"+String(lastClassTrigger)+"</b><br>"
        "<span style='font-size:11px;color:#5a7a8a'>"
        "POST JSON to <code>/classify</code>: {\"classification\":\"paper\",\"trigger\":1,\"probability\":0.95}"
        "</span>";
-  } else {
-    h+="No classification received yet. POST to <code>/classify</code>.";
-  }
+  else h+="No classification received yet.";
   h+="</div>";
 
   h+="<h2>Quick Actions</h2>"
@@ -919,8 +1077,8 @@ void handleDebug(){
      "<button class='danger' type='submit'>&#9888; Reset all to LIVE</button></form>"
      "<br><a class='btn' href='/'>&#8592; Main</a>"
      "<a class='btn' href='/terminal'>Terminal</a>"
-     "<a class='btn' href='/data'>JSON /data</a>";
-  h+="</body></html>";
+     "<a class='btn' href='/data'>JSON /data</a>"
+     "</body></html>";
   server.send(200,"text/html",h);
 }
 
@@ -944,19 +1102,38 @@ void handleDebugSet(){
     if(server.hasArg("mq7"))    ov.mq7   =strToOv(server.arg("mq7"));
     if(server.hasArg("reed"))   ov.reed  =strToOv(server.arg("reed"));
 
-    if(server.hasArg("ph_val"))    rv.ph         =constrain(server.arg("ph_val").toFloat(),0.0f,14.0f);
-    if(server.hasArg("temp_val"))  rv.temp_c     =constrain(server.arg("temp_val").toFloat(),-10.0f,60.0f);
-    if(server.hasArg("hum_val"))   rv.humidity   =constrain(server.arg("hum_val").toFloat(),0.0f,100.0f);
-    if(server.hasArg("weight_kg")) rv.weight_kg  =constrain(server.arg("weight_kg").toFloat(),0.0f,20.0f);
-    if(server.hasArg("soil_val"))  rv.soil       =constrain(server.arg("soil_val").toInt(),0,4095);
-    if(server.hasArg("npk_n"))     rv.nitrogen   =constrain(server.arg("npk_n").toInt(),0,200);
-    if(server.hasArg("npk_p"))     rv.phosphorus =constrain(server.arg("npk_p").toInt(),0,200);
-    if(server.hasArg("npk_k"))     rv.potassium  =constrain(server.arg("npk_k").toInt(),0,200);
-    if(server.hasArg("mq135_val")) rv.mq135      =constrain(server.arg("mq135_val").toInt(),0,4095);
-    if(server.hasArg("mq2_val"))   rv.mq2        =constrain(server.arg("mq2_val").toInt(),0,4095);
-    if(server.hasArg("mq4_val"))   rv.mq4        =constrain(server.arg("mq4_val").toInt(),0,4095);
-    if(server.hasArg("mq7_val"))   rv.mq7        =constrain(server.arg("mq7_val").toInt(),0,4095);
-    if(server.hasArg("reed_bool")) rv.reed_closed=(server.arg("reed_bool")=="1");
+    if(server.hasArg("ph_val"))      rv.ph        =constrain(server.arg("ph_val").toFloat(),0.0f,14.0f);
+    if(server.hasArg("temp_val"))    rv.temp_c    =constrain(server.arg("temp_val").toFloat(),-10.0f,60.0f);
+    if(server.hasArg("hum_val"))     rv.humidity  =constrain(server.arg("hum_val").toFloat(),0.0f,100.0f);
+    if(server.hasArg("weight_kg"))   rv.weight_kg =constrain(server.arg("weight_kg").toFloat(),0.0f,20.0f);
+    if(server.hasArg("soil_val"))    rv.soil      =constrain(server.arg("soil_val").toInt(),0,4095);
+    if(server.hasArg("npk_n"))       rv.nitrogen  =constrain(server.arg("npk_n").toInt(),0,200);
+    if(server.hasArg("npk_p"))       rv.phosphorus=constrain(server.arg("npk_p").toInt(),0,200);
+    if(server.hasArg("npk_k"))       rv.potassium =constrain(server.arg("npk_k").toInt(),0,200);
+    if(server.hasArg("mq135_val"))   rv.mq135     =constrain(server.arg("mq135_val").toInt(),0,4095);
+    if(server.hasArg("mq2_val"))     rv.mq2       =constrain(server.arg("mq2_val").toInt(),0,4095);
+    if(server.hasArg("mq4_val"))     rv.mq4       =constrain(server.arg("mq4_val").toInt(),0,4095);
+    if(server.hasArg("mq7_val"))     rv.mq7       =constrain(server.arg("mq7_val").toInt(),0,4095);
+    if(server.hasArg("reed_bool"))   rv.reed_closed=(server.arg("reed_bool")=="1");
+
+    // Dump duration
+    if(server.hasArg("dump_duration")){
+      dumpDurationS = constrain(server.arg("dump_duration").toInt(), 1, 300);
+      tprint("Dump duration set to "+String(dumpDurationS)+"s (step: "+String(calcStepDelay(dumpDurationS))+"ms)");
+    }
+
+    // Ultrasonic override
+    if(server.hasArg("ultra_mode")){
+      String m=server.arg("ultra_mode");
+      if(m=="off")   ultraMode=ULTRA_OFF;
+      else if(m=="range") ultraMode=ULTRA_RANGE;
+      else           ultraMode=ULTRA_LIVE;
+      tprint("Ultrasonic mode: "+m);
+    }
+    if(server.hasArg("ultra_cm")){
+      ultraRangeCm=constrain(server.arg("ultra_cm").toFloat(),0.0f,400.0f);
+      tprint("Ultrasonic fake cm: "+String(ultraRangeCm,1));
+    }
   }
   server.sendHeader("Location","/debug"); server.send(303);
 }
@@ -965,7 +1142,7 @@ void handleDebugSet(){
 // WEB — /data
 // =====================================================================
 void handleData(){
-  StaticJsonDocument<1200> doc;
+  StaticJsonDocument<1300> doc;
   doc["nitrogen"]          =sd.nitrogen;
   doc["phosphorus"]        =sd.phosphorus;
   doc["potassium"]         =sd.potassium;
@@ -979,9 +1156,11 @@ void handleData(){
   doc["carbon_monoxide"]   =sd.mq7;
   doc["ph"]                =sd.ph;
   doc["reed_switch"]       =sd.reed_state;
-  doc["gas_fan_active"]    =true;   // always on
+  doc["gas_fan_active"]    =true;
   doc["servo_state"]       =stateStr(curState);
   doc["sequences_done"]    =seqDone;
+  doc["dump_duration_s"]   =dumpDurationS;
+  doc["dump_step_ms"]      =calcStepDelay(dumpDurationS);
   doc["uptime_ms"]         =millis();
   doc["ap_ip"]             ="192.168.4.1";
   doc["sta_ip"]            =WiFi.localIP().toString();
@@ -1006,11 +1185,13 @@ void handleData(){
   doc["ov_mq4"]            =ovStr(ov.mq4);
   doc["ov_mq7"]            =ovStr(ov.mq7);
   doc["ov_reed"]           =ovStr(ov.reed);
-  // Classification passthrough
   doc["last_classification"]=lastClassification;
-  doc["last_class_prob"]    =lastClassProb;
-  doc["last_class_trigger"] =lastClassTrigger;
-  // Wireless trigger state
+  doc["last_class_prob"]   =lastClassProb;
+  doc["last_class_trigger"]=lastClassTrigger;
+  doc["distance_cm"]       =distCm;
+  doc["ultra_mode"]        =(ultraMode==ULTRA_OFF?"off":ultraMode==ULTRA_RANGE?"range":"live");
+  doc["ultra_range_cm"]    =ultraRangeCm;
+  doc["object_in_range"]   =(distCm>=DETECTION_DISTANCE_MIN&&distCm<=DETECTION_DISTANCE_MAX);
   doc["trig1_wireless"]    =trig1Wireless;
   doc["trig2_wireless"]    =trig2Wireless;
   String out; serializeJson(doc,out);
@@ -1024,12 +1205,14 @@ void handleServoSet(){
   if(server.hasArg("manual_servo")){
     manualServo=(server.arg("manual_servo")=="1");
     if(!manualServo){
-      manSvAngle[0]=90; manSvAngle[1]=90; manSvAngle[2]=180;
+      manSvAngle[0]=90; manSvAngle[1]=90; manSvAngle[2]=0;
+      manSvWritten[0]=manSvWritten[1]=manSvWritten[2]=-1;
       resetIdle();
-      tprint("Manual servo: DISABLED — state machine resumed");
+      tprint("Manual servo DISABLED — state machine resumed");
     } else {
       manSvAngle[0]=s1.read(); manSvAngle[1]=s2.read(); manSvAngle[2]=s3.read();
-      tprint("Manual servo: ENABLED — state machine paused");
+      manSvWritten[0]=manSvWritten[1]=manSvWritten[2]=-1; // force first write
+      tprint("Manual servo ENABLED — state machine paused");
     }
   }
   if(server.hasArg("sv0")){manSvAngle[0]=constrain(server.arg("sv0").toInt(),0,180);s1.write(manSvAngle[0]);tprint("SV1 -> "+String(manSvAngle[0])+"°");}
@@ -1039,53 +1222,35 @@ void handleServoSet(){
 }
 
 // =====================================================================
-// WEB — /classify  (POST JSON from ML classifier)
-// =====================================================================
-// Expected JSON body:
-//   { "classification": "paper", "trigger": 1, "probability": 0.95 }
-//
-// trigger 1 → pin 35 path (paper)   → servo 1 to 0°, skip grinder
-// trigger 2 → pin 34 path (organic) → servo 1 to 180°, full grind + dump
+// WEB — /classify
 // =====================================================================
 void handleClassify(){
   if(server.method()!=HTTP_POST){
-    server.send(405,"application/json","{\"error\":\"Method not allowed\"}");
-    return;
+    server.send(405,"application/json","{\"error\":\"Method not allowed\"}"); return;
   }
   if(!server.hasArg("plain")){
-    server.send(400,"application/json","{\"error\":\"No JSON body\"}");
-    return;
+    server.send(400,"application/json","{\"error\":\"No JSON body\"}"); return;
   }
   StaticJsonDocument<256> doc;
   DeserializationError err=deserializeJson(doc,server.arg("plain"));
   if(err){
-    tprint("Classify: JSON parse error — "+String(err.c_str()));
-    server.send(400,"application/json","{\"error\":\"Invalid JSON\"}");
-    return;
+    tprint("Classify: parse error — "+String(err.c_str()));
+    server.send(400,"application/json","{\"error\":\"Invalid JSON\"}"); return;
   }
-
-  String cls   = doc["classification"] | "";
-  int    trig  = doc["trigger"]        | 0;
-  float  prob  = doc["probability"]    | 0.0f;
-
+  String cls  = doc["classification"] | "";
+  int    trig = doc["trigger"]        | 0;
+  float  prob = doc["probability"]    | 0.0f;
   tprint("CLASSIFY: "+cls+" prob="+String(prob,2)+" trigger="+String(trig));
-
   if(trig==1){
     trig1Wireless=true; trig2Wireless=false;
-    tprint("Wireless TRIGGER 1 armed (paper path — skip grinder)");
+    tprint("Wireless TRIGGER 1 armed (paper — skip grinder)");
   } else if(trig==2){
     trig1Wireless=false; trig2Wireless=true;
-    tprint("Wireless TRIGGER 2 armed (organic path — grind + dump)");
+    tprint("Wireless TRIGGER 2 armed (organic — grind + dump)");
   } else {
-    server.send(400,"application/json","{\"error\":\"trigger must be 1 or 2\"}");
-    return;
+    server.send(400,"application/json","{\"error\":\"trigger must be 1 or 2\"}"); return;
   }
-
-  // Store for /data and debug panel display
-  lastClassification = cls;
-  lastClassProb      = prob;
-  lastClassTrigger   = trig;
-
+  lastClassification=cls; lastClassProb=prob; lastClassTrigger=trig;
   server.send(200,"application/json",
     "{\"status\":\"ok\",\"classification\":\""+cls+"\",\"trigger\":"+String(trig)+"}");
 }
@@ -1094,67 +1259,61 @@ void handleClassify(){
 // WEB — /terminal
 // =====================================================================
 void handleTerminal(){
-  String h="<!DOCTYPE html><html><head><meta charset='UTF-8'>"
-    "<title>NutriBin Terminal</title>"
-    "<style>"
-    "*{box-sizing:border-box;margin:0;padding:0}"
-    "body{background:#060a08;color:#a8c7a8;font-family:'Courier New',monospace;font-size:13px;height:100vh;display:flex;flex-direction:column}"
+  String h="<!DOCTYPE html><html><head><meta charset='UTF-8'><title>NutriBin Terminal</title>"
+    "<style>*{box-sizing:border-box;margin:0;padding:0}"
+    "body{background:#060a08;color:#a8c7a8;font-family:'Courier New',monospace;font-size:13px;"
+    "height:100vh;display:flex;flex-direction:column}"
     ".tb{background:#091410;border-bottom:1px solid #1a3a28;padding:7px 14px;display:flex;align-items:center;gap:10px;flex-shrink:0}"
     ".dot{width:11px;height:11px;border-radius:50%;display:inline-block}"
     ".dr{background:#c0392b}.dy{background:#e67e22}.dg{background:#27ae60}"
     ".tt{color:#3d6b50;font-size:11px;letter-spacing:2px;margin-left:6px}"
-    ".sb{background:#091410;border-bottom:1px solid #122a1e;padding:4px 14px;font-size:11px;color:#3d6b50;display:flex;gap:20px;flex-shrink:0}"
+    ".sb{background:#091410;border-bottom:1px solid #122a1e;padding:4px 14px;font-size:11px;"
+    "color:#3d6b50;display:flex;gap:20px;flex-shrink:0}"
     ".sok{color:#27ae60}.serr{color:#c0392b}"
     ".tw{flex:1;overflow:hidden;padding:10px 14px}"
     "#log{white-space:pre;overflow-y:auto;height:100%;line-height:1.6;color:#8ab89a}"
-    ".ts{color:#2d5a3d}.err{color:#c0392b}.wrn{color:#e67e22}.ok{color:#27ae60}.inf{color:#2980b9}"
-    ".cur{display:inline-block;width:8px;height:13px;background:#27ae60;animation:bl 1s step-end infinite;vertical-align:middle}"
+    ".ts{color:#2d5a3d}.err{color:#c0392b}.ok{color:#27ae60}.inf{color:#2980b9}"
+    ".cur{display:inline-block;width:8px;height:13px;background:#27ae60;"
+    "animation:bl 1s step-end infinite;vertical-align:middle}"
     "@keyframes bl{0%,100%{opacity:1}50%{opacity:0}}"
     ".bar{background:#091410;border-top:1px solid #122a1e;padding:6px 14px;display:flex;gap:8px;flex-shrink:0}"
-    ".bb{padding:4px 12px;background:#0b1e14;color:#3d6b50;border:1px solid #1a3a28;border-radius:2px;cursor:pointer;font-family:inherit;font-size:11px;text-decoration:none;display:inline-block}"
-    ".bb:hover{background:#1a3a28;color:#27ae60;border-color:#27ae60}"
+    ".bb{padding:4px 12px;background:#0b1e14;color:#3d6b50;border:1px solid #1a3a28;"
+    "border-radius:2px;cursor:pointer;font-family:inherit;font-size:11px;text-decoration:none;display:inline-block}"
+    ".bb:hover{background:#1a3a28;color:#27ae60}"
     "#ps{font-size:10px;color:#2d5a3d;margin-left:auto;align-self:center}"
     "</style>"
     "<script>"
     "var el;"
-    "function col(t){"
-    "  return t"
-    "   .replace(/\\[([\\s\\d.]+s)\\]/g,'<span class=\"ts\">[$1]</span>')"
-    "   .replace(/\\b(ERROR|ALARM|FAILED|TIMEOUT|OPEN|FATAL)\\b/g,'<span class=\"err\">$1</span>')"
-    "   .replace(/\\b(WARN|WARNING)\\b/g,'<span class=\"wrn\">$1</span>')"
-    "   .replace(/\\b(OK|connected|Ready|complete|cleared|joined)\\b/gi,'<span class=\"ok\">$1</span>')"
-    "   .replace(/\\b(STA|AP|DEBUG|POST|NPK|CLASSIFY)\\b/g,'<span class=\"inf\">$1</span>');"
-    "}"
-    "function poll(){"
-    "  fetch('/terminal/json').then(r=>r.text()).then(t=>{"
-    "    var atBot=(el.scrollHeight-el.scrollTop-el.clientHeight)<30;"
-    "    el.innerHTML=col(t)+'<span class=\"cur\"></span>';"
-    "    if(atBot)el.scrollTop=el.scrollHeight;"
-    "    document.getElementById('ps').textContent=new Date().toLocaleTimeString();"
-    "  });"
-    "}"
-    "window.onload=function(){el=document.getElementById('log');el.scrollTop=el.scrollHeight;setInterval(poll,2000);};"
-    "</script>"
-    "</head><body>"
-    "<div class='tb'>"
-    "<span class='dot dr'></span><span class='dot dy'></span><span class='dot dg'></span>"
-    "<span class='tt'>NUTRIBIN :: SERIAL LOG — "+WiFi.softAPIP().toString()+"</span>"
-    "</div>"
+    "function col(t){return t"
+    ".replace(/\\[([\\s\\d.]+s)\\]/g,'<span class=\"ts\">[$1]</span>')"
+    ".replace(/\\b(ERROR|ALARM|FAILED|TIMEOUT|OPEN|FATAL)\\b/g,'<span class=\"err\">$1</span>')"
+    ".replace(/\\b(OK|connected|Ready|complete|cleared|joined|done)\\b/gi,'<span class=\"ok\">$1</span>')"
+    ".replace(/\\b(STA|AP|DEBUG|NPK|CLASSIFY|DUMP)\\b/g,'<span class=\"inf\">$1</span>');}"
+    "function poll(){fetch('/terminal/json').then(r=>r.text()).then(t=>{"
+    "var atBot=(el.scrollHeight-el.scrollTop-el.clientHeight)<30;"
+    "el.innerHTML=col(t)+'<span class=\"cur\"></span>';"
+    "if(atBot)el.scrollTop=el.scrollHeight;"
+    "document.getElementById('ps').textContent=new Date().toLocaleTimeString();});}"
+    "window.onload=function(){el=document.getElementById('log');"
+    "el.scrollTop=el.scrollHeight;setInterval(poll,2000);};"
+    "</script></head><body>"
+    "<div class='tb'><span class='dot dr'></span><span class='dot dy'></span>"
+    "<span class='dot dg'></span>"
+    "<span class='tt'>NUTRIBIN :: LOG — "+WiFi.softAPIP().toString()+"</span></div>"
     "<div class='sb'>"
     "<span>state: <b>"+stateStr(curState)+"</b></span>"
     "<span>seq: <b>"+String(seqDone)+"</b></span>"
+    "<span>dump: <b>"+String(dumpDurationS)+"s</b></span>"
     "<span>reed: <b>"+(reedOpen?"<span class='serr'>OPEN</span>":"<span class='sok'>CLOSED</span>")+"</b></span>"
-    "<span>fan: <b class='sok'>always on</b></span>"
-    "<span>STA: <b class='"+(WiFi.status()==WL_CONNECTED?"sok":"serr")+"'>"+(WiFi.status()==WL_CONNECTED?"joined":"ap-only")+"</b></span>"
-    "</div>"
+    "<span>STA: <b class='"+(WiFi.status()==WL_CONNECTED?"sok":"serr")+"'>"
+    +(WiFi.status()==WL_CONNECTED?"joined":"ap-only")+"</b></span></div>"
     "<div class='tw'><div id='log'>"+tlogDump()+"<span class='cur'></span></div></div>"
     "<div class='bar'>"
     "<a class='bb' href='/'>&#8592; Main</a>"
     "<a class='bb' href='/debug'>Debug</a>"
     "<a class='bb' href='/data'>JSON</a>"
     "<a class='bb' href='/terminal'>Refresh</a>"
-    "<span id='ps'>polling…</span>"
-    "</div>"
+    "<span id='ps'>polling…</span></div>"
     "</body></html>";
   server.send(200,"text/html",h);
 }
