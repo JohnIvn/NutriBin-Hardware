@@ -32,6 +32,7 @@
 #include <DHT.h>
 #include <HX711.h>
 #include <HardwareSerial.h>
+#include <EEPROM.h>
 
 // =====================================================================
 // PIN DEFINITIONS
@@ -99,6 +100,10 @@
 #define DHT_TIMEOUT_MS           3000
 #define HX711_TARE_TIMEOUT_MS    3000
 #define NPK_CONFIRM_READS        2
+
+// ── EEPROM Configuration ──────────────────────────────────────────────
+#define EEPROM_SIZE              512
+#define EEPROM_RANGE_VALS_ADDR   0    // RangeVals struct starts at address 0
 
 // ── Dump cycle defaults ───────────────────────────────────────────────
 // DUMP_DURATION_S  : total seconds servo 3 spends sweeping back and forth
@@ -236,11 +241,11 @@ bool         trig1          = false, trig2=false;
 bool         trig1Wireless  = false, trig2Wireless=false;
 float        distCm         = 0;
 int          s1Target       = 0;
-int          s1CurrentAngle = 90;
+int          s1CurrentAngle = 70;
 int          seqDone        = 0;
 
 bool manualServo    = false;
-int  manSvAngle[3]  = {90, 90, 0};  // s3 idles at 0° (chute closed)
+int  manSvAngle[3]  = {70, 90, 0};  // s3 idles at 0° (chute closed)
 int  manSvWritten[3]= {-1, -1, -1}; // last angle actually sent; -1 = never written
                                      // Only write when angle changes to avoid
                                      // hammering the PWM timer and causing jitter.
@@ -309,9 +314,29 @@ void runDumpSweep();
 // =====================================================================
 // SETUP
 // =====================================================================
+// =====================================================================
+// EEPROM — SAVE/LOAD RANGE VALUES
+// =====================================================================
+void saveRangeVals() {
+  EEPROM.put(EEPROM_RANGE_VALS_ADDR, rv);
+  if (EEPROM.commit()) {
+    tprint("DEBUG: Range values saved to EEPROM");
+  } else {
+    tprint("ERROR: Failed to save range values to EEPROM");
+  }
+}
+
+void loadRangeVals() {
+  EEPROM.get(EEPROM_RANGE_VALS_ADDR, rv);
+  tprint("DEBUG: Range values loaded from EEPROM");
+}
+
 void setup() {
   Serial.begin(SERIAL_BAUD); delay(800);
   tprint("NutriBin v4 — 30-pin ESP32, updated pins, adjustable dump");
+
+  EEPROM.begin(EEPROM_SIZE);
+  loadRangeVals();
 
   pinMode(TRIGGER_1_PIN,INPUT); pinMode(TRIGGER_2_PIN,INPUT);
   pinMode(REED_SWITCH_PIN,INPUT_PULLUP);
@@ -322,7 +347,7 @@ void setup() {
   tprint("Gas fan: ON (always-on)");
 
   setupServos();
-  s1.write(90); s1CurrentAngle=90;
+  s1.write(70); s1CurrentAngle=70;
   s2.write(90);
   s3.write(0);   // s3 idles at 0° — chute closed position
 
@@ -554,8 +579,8 @@ void startAP() {
 }
 
 void connectWiFi() {
-  const char* ssids[]={WIFI_SSID_1,WIFI_SSID_2,WIFI_SSID_3,WIFI_SSID_4};
-  const char* pass[] ={WIFI_PASSWORD_1,WIFI_PASSWORD_2,WIFI_PASSWORD_3,WIFI_PASSWORD_4};
+  const char* ssids[]={WIFI_SSID_2,WIFI_SSID_1,WIFI_SSID_3,WIFI_SSID_4};
+  const char* pass[] ={WIFI_PASSWORD_2,WIFI_PASSWORD_1,WIFI_PASSWORD_3,WIFI_PASSWORD_4};
   WiFi.config(STA_STATIC_IP,STA_GATEWAY,STA_SUBNET,STA_DNS);
   for(int n=0;n<4;n++){
     WiFi.begin(ssids[n],pass[n]);
@@ -1102,19 +1127,21 @@ void handleDebugSet(){
     if(server.hasArg("mq7"))    ov.mq7   =strToOv(server.arg("mq7"));
     if(server.hasArg("reed"))   ov.reed  =strToOv(server.arg("reed"));
 
-    if(server.hasArg("ph_val"))      rv.ph        =constrain(server.arg("ph_val").toFloat(),0.0f,14.0f);
-    if(server.hasArg("temp_val"))    rv.temp_c    =constrain(server.arg("temp_val").toFloat(),-10.0f,60.0f);
-    if(server.hasArg("hum_val"))     rv.humidity  =constrain(server.arg("hum_val").toFloat(),0.0f,100.0f);
-    if(server.hasArg("weight_kg"))   rv.weight_kg =constrain(server.arg("weight_kg").toFloat(),0.0f,20.0f);
-    if(server.hasArg("soil_val"))    rv.soil      =constrain(server.arg("soil_val").toInt(),0,4095);
-    if(server.hasArg("npk_n"))       rv.nitrogen  =constrain(server.arg("npk_n").toInt(),0,200);
-    if(server.hasArg("npk_p"))       rv.phosphorus=constrain(server.arg("npk_p").toInt(),0,200);
-    if(server.hasArg("npk_k"))       rv.potassium =constrain(server.arg("npk_k").toInt(),0,200);
-    if(server.hasArg("mq135_val"))   rv.mq135     =constrain(server.arg("mq135_val").toInt(),0,4095);
-    if(server.hasArg("mq2_val"))     rv.mq2       =constrain(server.arg("mq2_val").toInt(),0,4095);
-    if(server.hasArg("mq4_val"))     rv.mq4       =constrain(server.arg("mq4_val").toInt(),0,4095);
-    if(server.hasArg("mq7_val"))     rv.mq7       =constrain(server.arg("mq7_val").toInt(),0,4095);
-    if(server.hasArg("reed_bool"))   rv.reed_closed=(server.arg("reed_bool")=="1");
+    bool rangeValChanged = false;
+    if(server.hasArg("ph_val"))      {rv.ph        =constrain(server.arg("ph_val").toFloat(),0.0f,14.0f); rangeValChanged=true;}
+    if(server.hasArg("temp_val"))    {rv.temp_c    =constrain(server.arg("temp_val").toFloat(),-10.0f,60.0f); rangeValChanged=true;}
+    if(server.hasArg("hum_val"))     {rv.humidity  =constrain(server.arg("hum_val").toFloat(),0.0f,100.0f); rangeValChanged=true;}
+    if(server.hasArg("weight_kg"))   {rv.weight_kg =constrain(server.arg("weight_kg").toFloat(),0.0f,20.0f); rangeValChanged=true;}
+    if(server.hasArg("soil_val"))    {rv.soil      =constrain(server.arg("soil_val").toInt(),0,4095); rangeValChanged=true;}
+    if(server.hasArg("npk_n"))       {rv.nitrogen  =constrain(server.arg("npk_n").toInt(),0,200); rangeValChanged=true;}
+    if(server.hasArg("npk_p"))       {rv.phosphorus=constrain(server.arg("npk_p").toInt(),0,200); rangeValChanged=true;}
+    if(server.hasArg("npk_k"))       {rv.potassium =constrain(server.arg("npk_k").toInt(),0,200); rangeValChanged=true;}
+    if(server.hasArg("mq135_val"))   {rv.mq135     =constrain(server.arg("mq135_val").toInt(),0,4095); rangeValChanged=true;}
+    if(server.hasArg("mq2_val"))     {rv.mq2       =constrain(server.arg("mq2_val").toInt(),0,4095); rangeValChanged=true;}
+    if(server.hasArg("mq4_val"))     {rv.mq4       =constrain(server.arg("mq4_val").toInt(),0,4095); rangeValChanged=true;}
+    if(server.hasArg("mq7_val"))     {rv.mq7       =constrain(server.arg("mq7_val").toInt(),0,4095); rangeValChanged=true;}
+    if(server.hasArg("reed_bool"))   {rv.reed_closed=(server.arg("reed_bool")=="1"); rangeValChanged=true;}
+    if(rangeValChanged) saveRangeVals();
 
     // Dump duration
     if(server.hasArg("dump_duration")){
