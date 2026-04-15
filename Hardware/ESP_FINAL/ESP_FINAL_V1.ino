@@ -27,12 +27,21 @@
 
 #include <ESP32Servo.h>
 #include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <WebServer.h>
 #include <DHT.h>
 #include <HX711.h>
 #include <HardwareSerial.h>
 #include <EEPROM.h>
+
+// =====================================================================
+// SERVER CONFIG
+// =====================================================================
+const char* USER_ID = "57b9ff77-7c99-4b08-9d90-239aed1a78a4";
+const char* MACHINE_ID = "bdb2bc26-614e-4c21-9e2c-23669ee52232";
+const char* SERVER_URL = "https://nutribin-server-backend-production.up.railway.app/hardware/sensor-data";
 
 // =====================================================================
 // PIN DEFINITIONS
@@ -87,7 +96,7 @@
 #define DISTANCE_READ_INTERVAL   200
 #define COOLDOWN_TIME            2000
 
-#define SAMPLE_INTERVAL          2000
+#define SAMPLE_INTERVAL          1000
 #define CALIBRATION_FACTOR       420.0
 
 #define PH_OFFSET                0.0
@@ -304,6 +313,7 @@ bool safeTare(unsigned long ms=HX711_TARE_TIMEOUT_MS);
 String ovStr(SensorOverride o); SensorOverride strToOv(const String& s);
 void handleRoot(); void handleDebug(); void handleDebugSet();
 void handleData(); void handleTerminal(); void handleTerminalJson();
+void postDataToServer();
 void handleServoSet(); void handleClassify();
 String badge(SensorOverride o);
 String sensorRow(const String& lbl, const String& val, bool ok);
@@ -437,7 +447,11 @@ void loop() {
     tprint("W:"+String(sd.weight_kg,2)+(sd.weight_ok?"":"[OFF]")+
            " NPK:"+String(sd.nitrogen)+"/"+String(sd.phosphorus)+"/"+String(sd.potassium)+
            " pH:"+String(sd.ph,2)+" T:"+String(sd.temp_c,1)+
-           " Reed:"+(reedOpen?"OPEN":"CLOSED")+" "+stateStr(curState));
+           " Reed:"+(reedOpen?"OPEN":"CLOSED")+" "+stateStr(curState)+
+           " IP:"+WiFi.localIP().toString());
+           
+    // Post data to server every interval
+    postDataToServer();
   }
   if(now-lastNPKT>=1000){ lastNPKT=now; readNPK_all(); }
 
@@ -581,7 +595,10 @@ void startAP() {
 void connectWiFi() {
   const char* ssids[]={WIFI_SSID_2,WIFI_SSID_1,WIFI_SSID_3,WIFI_SSID_4};
   const char* pass[] ={WIFI_PASSWORD_2,WIFI_PASSWORD_1,WIFI_PASSWORD_3,WIFI_PASSWORD_4};
-  WiFi.config(STA_STATIC_IP,STA_GATEWAY,STA_SUBNET,STA_DNS);
+  
+  // Use DHCP instead of forcing a static IP so that the gateway and DNS route correctly
+  // WiFi.config(STA_STATIC_IP,STA_GATEWAY,STA_SUBNET,STA_DNS);
+
   for(int n=0;n<4;n++){
     WiFi.begin(ssids[n],pass[n]);
     for(int i=0;i<10&&WiFi.status()!=WL_CONNECTED;i++) delay(500);
@@ -1346,3 +1363,57 @@ void handleTerminal(){
 }
 
 void handleTerminalJson(){ server.send(200,"text/plain",tlogDump()); }
+
+// =====================================================================
+// POST DATA TO SERVER
+// =====================================================================
+void postDataToServer() {
+  if(WiFi.status() != WL_CONNECTED) {
+    tprint("POST Skipped: No WiFi connection.");
+    return;
+  }
+
+  tprint("Sending data to server...");
+  
+  WiFiClientSecure client;
+  client.setInsecure(); // Disable SSL cert check
+
+  HTTPClient http;
+  if(http.begin(client, SERVER_URL)) {
+    http.addHeader("Content-Type", "application/json");
+
+    StaticJsonDocument<512> doc;
+    doc["user_id"] = USER_ID;
+    doc["machine_id"] = MACHINE_ID;
+    
+    doc["nitrogen"] = sd.nitrogen;
+    doc["phosphorus"] = sd.phosphorus;
+    doc["potassium"] = sd.potassium;
+    doc["temperature"] = sd.temp_c;
+    doc["humidity"] = sd.humidity;
+    doc["soil_moisture"] = sd.soil;
+    doc["weight_kg"] = sd.weight_kg;
+    doc["mq135"] = sd.mq135;
+    doc["ph"] = sd.ph;
+    doc["methane"] = sd.mq4;
+    doc["air_quality"] = sd.mq135;
+    doc["combustible_gases"] = sd.mq2;
+    doc["carbon_monoxide"] = sd.mq7;
+    doc["reed_switch"] = sd.reed_state ? 1 : 0;
+
+    String jsonBody;
+    serializeJson(doc, jsonBody);
+
+    int httpCode = http.POST(jsonBody);
+    if(httpCode > 0) {
+      tprint("POST success: HTTP " + String(httpCode));
+      String payload = http.getString();
+      tprint("Response: " + payload);
+    } else {
+      tprint("POST failed: " + http.errorToString(httpCode));
+    }
+    http.end();
+  } else {
+    tprint("POST failed: Could not connect to server");
+  }
+}
